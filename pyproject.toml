@@ -1,0 +1,22 @@
+[project]
+name = "antrozous"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Shreyaas14", email = "shreyaas.sureshbabu114@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.4.1",
+    "cryptography>=48.0.0",
+    "pydantic>=2.13.4",
+    "websockets>=16.0",
+]
+
+[project.scripts]
+antrozous = "antrozous:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
