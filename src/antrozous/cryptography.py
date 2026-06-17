@@ -19,6 +19,7 @@ def generate_keypair():
 
   return priv_key, pub_key
 
+## TODO: Figure out where these keypairs get stored
 def master_keypair():
   master_priv_key, master_pub_key = generate_keypair()
   return master_priv_key, master_pub_key
