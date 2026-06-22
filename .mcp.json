@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "antrozous-gate": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/Users/anishrane/antrozous/mcp_gate.py"],
+      "env": {
+        "RELAY_URL": "http://127.0.0.1:8000"
+      }
+    }
+  }
+}
