@@ -20,15 +20,18 @@ Pure stdlib (urllib) so Claude Code launches it on the system python3 with no
 virtualenv coupling. Protocol: MCP 2025-11-25, newline-delimited JSON-RPC.
 stdout = JSON-RPC only; logs go to stderr.
 """
-import sys, os, json, urllib.request, urllib.error
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+import identity
 
-AGENT_ID = os.environ.get("AGENT_ID", "agent-unknown")
 USER_ID = os.environ.get("USER_ID") or os.environ.get("USER") or "user"
 RELAY_URL = os.environ.get("RELAY_URL", "http://127.0.0.1:8000").rstrip("/")
 
 CLIENT_ELICITATION = False
 _eid = 0
-
 
 def log(*a):
     print("[antrozous-gate]", *a, file=sys.stderr, flush=True)
@@ -99,7 +102,8 @@ def do_send(_id, args):
     if not to_agent or not content:
         tool_result(_id, "send_message requires non-empty 'to_agent' and 'content'.", is_error=True)
         return
-    payload = {"from_agent": AGENT_ID, "from_user": USER_ID,
+    agent_id = identity.resolve_agent_id(identity.find_directory())
+    payload = {"from_agent": agent_id, "from_user": USER_ID,
                "to_agent": to_agent, "to_user": to_user or to_agent,
                "content": content, "timestamp": _now_iso()}
     try:
