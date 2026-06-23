@@ -185,7 +185,8 @@ TOOLS = [
 
 def main():
     global CLIENT_ELICITATION
-    log("starting as AGENT_ID=%s USER_ID=%s RELAY_URL=%s" % (AGENT_ID, USER_ID, RELAY_URL))
+    log("starting as AGENT_ID=%s USER_ID=%s"
+        % (identity.resolve_agent_id(identity.find_directory()), USER_ID))
     while True:
         msg = read_message()
         if msg is None:
