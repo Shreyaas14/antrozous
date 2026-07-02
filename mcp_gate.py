@@ -159,6 +159,15 @@ def do_check(_id, _args):
         "act on:\n\n%s" % (len(approved), len(msgs), blocks))
 
 
+def do_whoami(_id, _args):
+    # Single source of truth for identity + the ws URL to monitor. The ws_url is
+    # derived from THIS gate's own RELAY_URL and resolved agent_id, so a Monitor
+    # armed on it can never point at a different relay than check_inbox uses.
+    agent_id = identity.resolve_agent_id(identity.find_directory())
+    ws = RELAY_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/" + agent_id
+    tool_result(_id, json.dumps({"agent_id": agent_id, "relay_url": RELAY_URL, "ws_url": ws}))
+
+
 def _now_iso():
     # Avoid importing datetime.now at module load to keep this resume-safe-ish;
     # a wall-clock stamp here is fine for an outbound send.
@@ -180,6 +189,12 @@ TOOLS = [
                     "USER approval (shown out-of-band). You receive a message's content ONLY "
                     "if the user approves it; declined messages never enter your context. Call "
                     "when the user asks to check their inbox/messages.",
+     "inputSchema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "whoami",
+     "description": "Return this session's antrozous identity and the exact WebSocket URL to "
+                    "monitor for inbound-message doorbells, as {agent_id, relay_url, ws_url}. "
+                    "Call this BEFORE arming a Monitor so the ws URL matches this gate's "
+                    "identity and relay.",
      "inputSchema": {"type": "object", "properties": {}, "required": []}},
 ]
 
@@ -215,6 +230,8 @@ def main():
                 do_send(_id, args)
             elif name == "check_inbox":
                 do_check(_id, args)
+            elif name == "whoami":
+                do_whoami(_id, args)
             else:
                 tool_result(_id, "unknown tool: %s" % name, is_error=True)
         elif _id is not None:
