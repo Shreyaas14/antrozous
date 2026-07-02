@@ -81,9 +81,12 @@ async def send_message(msg: Message):
     inboxes[msg.to_agent] = []
   inboxes[msg.to_agent].append(msg.model_dump(mode="json"))
   n = len(inboxes[msg.to_agent])
-  # DOORBELL: content-free trigger. NO body, NO sender string (both are
-  # attacker-controlled) — only a fixed type and a numeric count. The recipient
-  # reacts by pulling the real content through the check_inbox approval gate.
+  # DOORBELL: a NEUTRAL, content-free signal — {type, pending} only. It must NOT
+  # contain instructions: a receiver correctly treats channel content as untrusted
+  # data (an embedded "call check_inbox" reads as prompt injection and is refused).
+  # The doorbell's job is only to signal "something arrived"; the decision to call
+  # check_inbox comes from a TRUSTED standing instruction (the user / a skill),
+  # never from the frame itself.
   await manager.doorbell(msg.to_agent, {"type": "doorbell", "pending": n})
   return {"status": "sent", "pending": n}
 

@@ -41,7 +41,7 @@ async def main():
         await asyncio.to_thread(post_send, "hello 1")
         db = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
         assert db["type"] == "doorbell", db
-        # doorbell must NOT carry body or sender strings
+        # doorbell must be a NEUTRAL signal — no instructions, no body, no sender
         assert set(db.keys()) <= {"type", "pending"}, ("doorbell leaked fields: %s" % db)
         print("DOORBELL   -> /send pushed a content-free doorbell (pending=%d)       OK" % db["pending"])
 
