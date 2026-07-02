@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Personal, per-user Claude Code settings (agent identity, etc.)
+.claude/settings.local.json
