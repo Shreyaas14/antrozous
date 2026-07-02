@@ -115,13 +115,14 @@ def do_send(_id, args):
 
 
 def do_check(_id, _args):
+    agent_id = identity.resolve_agent_id(identity.find_directory())
     try:
-        msgs = http("GET", "/inbox/%s" % AGENT_ID) or []
+        msgs = http("GET", "/inbox/%s" % agent_id) or []
     except urllib.error.URLError as e:
         tool_result(_id, "Could not reach relay at %s (%s)." % (RELAY_URL, e), is_error=True)
         return
     if not msgs:
-        tool_result(_id, "Inbox empty for %s." % AGENT_ID)
+        tool_result(_id, "Inbox empty for %s." % agent_id)
         return
     if not CLIENT_ELICITATION:
         tool_result(_id, "BLOCKED: client does not support elicitation; %d message(s) "
@@ -141,7 +142,7 @@ def do_check(_id, _args):
 
     # Consume everything we just showed so it isn't re-prompted next check.
     try:
-        http("POST", "/inbox/%s/consume?count=%d" % (AGENT_ID, len(msgs)))
+        http("POST", "/inbox/%s/consume?count=%d" % (agent_id, len(msgs)))
     except urllib.error.URLError as e:
         log("consume failed:", e)
 
