@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Attachment blob store + in-memory relay backup (runtime state, not source)
+blobs/
+messages.json
+
 # Personal, per-user Claude Code settings (agent identity, etc.)
 .claude/settings.local.json
