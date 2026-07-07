@@ -240,12 +240,16 @@ def do_check(_id, _args):
                                             _human_size(a.get("size", 0)),
                                             a.get("sha256", "")[:12])
                 for a in atts)
+        # BOUND the untrusted content — a long (or hostile) message must not be
+        # able to shove the Accept/Decline buttons past the bottom of the terminal.
+        content = m.get("content", "")
+        snippet = content if len(content) <= 400 else content[:400] + " …[truncated]"
         prompt = ("INBOUND MESSAGE %d of %d — PENDING APPROVAL\n\n"
                   "From: %s\nAt:   %s\n\n%s%s\n\n"
                   "Accept to add this message to Claude's context (and download any "
                   "attachments to quarantine), or Decline to discard."
                   % (i, len(msgs), sender, m.get("timestamp", "?"),
-                     m.get("content", ""), att_lines))
+                     snippet, att_lines))
         if elicit(prompt) == "accept":
             approved.append(m)
 
