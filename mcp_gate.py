@@ -226,7 +226,7 @@ def do_check(_id, _args):
                          "No content disclosed." % len(msgs), is_error=True)
         return
 
-    approved = []
+    approved, decided = [], 0
     for i, m in enumerate(msgs, 1):
         sender = "%s / %s" % (m.get("from_agent", "?"), m.get("from_user", "?"))
         atts = m.get("attachments") or []
@@ -240,24 +240,41 @@ def do_check(_id, _args):
                                             _human_size(a.get("size", 0)),
                                             a.get("sha256", "")[:12])
                 for a in atts)
-        # BOUND the untrusted content — a long (or hostile) message must not be
-        # able to shove the Accept/Decline buttons past the bottom of the terminal.
+        # Show the FULL message — reviewing ALL of it IS the anti-injection gate,
+        # so we deliberately do NOT truncate. Claude Code's elicitation popup
+        # scrolls (↑/↓ · PgUp/PgDn · Home/End · mouse, v2.1.76+), so long content
+        # stays fully reviewable and Accept/Decline remain reachable at the bottom.
         content = m.get("content", "")
-        snippet = content if len(content) <= 400 else content[:400] + " …[truncated]"
-        prompt = ("INBOUND MESSAGE %d of %d — PENDING APPROVAL\n\n"
+        prompt = ("REVIEW, THEN DECIDE — scroll (↓ / PgDn) to read the whole message; "
+                  "Accept / Decline are at the bottom.\n\n"
+                  "INBOUND MESSAGE %d of %d — PENDING APPROVAL\n\n"
                   "From: %s\nAt:   %s\n\n%s%s\n\n"
-                  "Accept to add this message to Claude's context (and download any "
-                  "attachments to quarantine), or Decline to discard."
+                  "— end of message —\n"
+                  "Accept = add to Claude's context (downloads attachments to "
+                  "quarantine).   Decline = discard."
                   % (i, len(msgs), sender, m.get("timestamp", "?"),
-                     snippet, att_lines))
-        if elicit(prompt) == "accept":
+                     content, att_lines))
+        action = elicit(prompt)
+        if action == "accept":
             approved.append(m)
+            decided += 1
+        elif action == "decline":
+            decided += 1
+        else:
+            # Dismissed/cancelled (e.g. clicked away without deciding). Leave THIS
+            # message and all the ones after it PENDING so they can be re-surfaced
+            # on the next check_inbox — never silently consumed.
+            break
 
-    # Consume everything we just showed so it isn't re-prompted next check.
-    try:
-        http("POST", "/inbox/%s/consume?count=%d" % (agent_id, len(msgs)))
-    except urllib.error.URLError as e:
-        log("consume failed:", e)
+    # Consume ONLY the messages the user explicitly decided on (accept or decline).
+    # Because we process oldest-first and break on the first dismissal, the decided
+    # messages are exactly the contiguous front of the queue — which is what the
+    # count-based consume (oldest-N) removes. Dismissed/unreviewed messages stay.
+    if decided:
+        try:
+            http("POST", "/inbox/%s/consume?count=%d" % (agent_id, decided))
+        except urllib.error.URLError as e:
+            log("consume failed:", e)
 
     if not approved:
         tool_result(_id, "Reviewed %d message(s); user APPROVED none. No content disclosed." % len(msgs))
