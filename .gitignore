@@ -15,3 +15,6 @@ messages.json
 
 # Personal, per-user Claude Code settings (agent identity, etc.)
 .claude/settings.local.json
+
+# Per-project antrozous identity (runtime state, never source)
+.antrozous/

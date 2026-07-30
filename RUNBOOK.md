@@ -20,54 +20,27 @@ So identity is now per-directory and auto-created; you no longer have to pass
 defaults to `http://127.0.0.1:8000` but is pinned to Railway by the registration
 below.
 
-## 0. Pre-setup steps (use it from ANYWHERE)
+## 0. Load the Claude plugin
 
-Do these once. They register the gate and the identity hook at USER scope (global),
-so antrozous works in every Claude session from every directory — no per-project
-`.mcp.json`, no `AGENT_ID` env on launch.
-
-### Step 1 — register the gate (MCP server) at user scope
+From the directory containing this repository:
 
 ```bash
-claude mcp add -s user antrozous-gate \
-  -e RELAY_URL=https://antrozous-testing-production.up.railway.app \
-  -- python3 /Users/shreyaas/Desktop/projects_with_anish/antrozous/mcp_gate.py
+claude --plugin-dir ./antrozous
 ```
 
-- `-s user` writes to `~/.claude.json` (global), not the project — that's what
-  makes it work from anywhere.
-- `-e RELAY_URL=...` pins the gate to the Railway relay instead of localhost.
-- The absolute path to `mcp_gate.py` is fine here (local machine, not a shipped
-  plugin).
+The plugin's portable `.mcp.json` starts the gate via `${CLAUDE_PLUGIN_ROOT}` and
+its `SessionStart` hook creates and announces the per-project identity. No absolute
+installation path, user-scoped MCP registration, or manual settings hook is needed.
 
-Verify: `claude mcp list` (or `/mcp` in a session) should show `antrozous-gate`.
-Remove with `claude mcp remove -s user antrozous-gate`.
+For development, validate the package before launching it:
 
-### Step 2 — register the identity hook (auto-announce your handle on boot)
-
-Add a `SessionStart` entry under `hooks` in `~/.claude/settings.json` (merge into
-any existing `hooks` block — don't overwrite it):
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [ { "type": "command",
-        "command": "python3 /Users/shreyaas/Desktop/projects_with_anish/antrozous/scripts/bootstrap_identity.py" } ] }
-    ]
-  }
-}
+```bash
+claude plugin validate ./antrozous
 ```
 
-On each new session this creates `./.antrozous/identity.json` if missing and prints
-`Your Agent ID: agent-xxxx`. Verify the file still parses after editing:
-`python3 -c "import json; json.load(open('$HOME/.claude/settings.json'))"`.
-
-Note: the gate's tier-3 fallback also creates identity on first tool use, so Step 2
-is a convenience (it shows you your handle up front); Step 1 is the load-bearing one.
-
-After both steps: open `claude` in ANY directory → the gate tools are available and
-that directory becomes its own agent (per-directory identity).
+When an identity is created inside a Git repository, antrozous adds `.antrozous/`
+to the repository's local `.git/info/exclude`. The identity therefore stays local
+and does not appear in `git status` or change the repository's tracked `.gitignore`.
 
 ## 1. Start the relay (Terminal 1)
 ```bash

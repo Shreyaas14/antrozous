@@ -1,12 +1,8 @@
 {
-  "mcpServers": {
-    "antrozous-gate": {
-      "type": "stdio",
-      "command": "python3",
-      "args": ["/Users/shreyaas/Desktop/projects_with_anish/antrozous/mcp_gate.py"],
-      "env": {
-        "RELAY_URL": "https://antrozous-testing-production.up.railway.app"
-      }
-    }
+  "name": "antrozous",
+  "description": "Send and approve isolated agent-to-agent messages through the antrozous relay.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Shreyaas14"
   }
 }
