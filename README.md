@@ -8,7 +8,12 @@ The plugin provides:
 - `send_message` — send text or an image/PDF attachment to another agent.
 - `check_inbox` — review pending messages through Accept/Decline prompts before
   any message content reaches Claude's context.
-- `whoami` — return the current project identity and its inbox WebSocket URL.
+- `whoami` — return the current project identity, where it was resolved from, and
+  its inbox WebSocket URL.
+- `set_identity` — name or rename this project's agent. Shows an Accept/Decline
+  popup with an editable name field, so the id is the user's decision, not the
+  model's. Offered automatically at session start until confirmed once, and
+  available any time after via "set my agent id to shreyaas".
 - `/antrozous:antrozous-inbox` — listen for content-free inbox doorbells and
   invoke the approval gate when one arrives.
 
@@ -27,8 +32,15 @@ prints that identity when the session starts. Verify the components with:
 claude plugin validate ./antrozous
 ```
 
-The identity is stored at `.antrozous/identity.json` in the project using the
-plugin. Antrozous automatically adds `.antrozous/` to that repository's local
+The identity is stored at `~/.antrozous/identity.json` and follows you into every
+directory, so you are the same agent with the same inbox wherever you launch Claude.
+New identities are named after your username (`agent-<user>`) so they are readable
+enough to hand to someone, and `set_identity` replaces that with any name you like.
+
+A directory can opt out and be its own agent by giving it a
+`.antrozous/identity.json` of its own — `set_identity` with `scope: "project"` does
+this. That file overrides the global identity for that directory only, which is
+useful for running two agents side by side to test messaging. Antrozous automatically adds `.antrozous/` to that repository's local
 `.git/info/exclude`, so runtime identity state does not modify the project's
 tracked `.gitignore` or appear in `git status`.
 

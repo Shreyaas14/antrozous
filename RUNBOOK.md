@@ -9,11 +9,62 @@ through the relay, with strict isolation (declined messages never enter context)
   tools. Pure stdlib; Claude launches it on system `python3`. Registered in `.mcp.json`.
 - **CLI sender** (`send_cli.py`) — push a message without a Claude session.
 
-Identity is resolved by the gate in three tiers (first hit wins):
+Identity is resolved by the gate in four tiers (first hit wins):
 1. env `AGENT_ID` — explicit override (used by self-tests / forcing a 2nd agent
    in one dir).
-2. `./.antrozous/identity.json` — the saved per-directory handle (normal case).
-3. generate — if neither exists, mint `agent-<hex>`, write it, and reuse it.
+2. `./.antrozous/identity.json` — a directory that has deliberately opted OUT of
+   the global identity, becoming its own agent with its own inbox.
+3. `~/.antrozous/identity.json` — **the normal case.** One identity that follows
+   you into every directory, so you are the same agent from anywhere.
+4. generate — if none exist, mint tier 3 and reuse it forever.
+
+Tier 3 is what makes the plugin behave identically from any directory. It is also
+why the gate no longer creates a stray identity when launched without
+`CLAUDE_PROJECT_DIR` (`send_cli.py`, `gate_selftest.py`, non-Claude-Code MCP
+hosts): it falls back to the global file instead of the process's cwd.
+
+`ANTROZOUS_HOME` relocates tier 3 — used by the test suite so it never touches a
+real `~/.antrozous`, and useful for running two independent agents on one machine.
+
+Generated global ids are `agent-<user>`; project-scoped ones are
+`agent-<project>-<hex>`. `set_identity` writes tier 3 by default, and when the
+current directory has a tier-2 file shadowing it, the popup discloses that
+accepting will delete that file so the directory rejoins the global identity.
+Pass `scope: "project"` to deliberately opt a directory out instead.
+
+The naming popup is offered
+**automatically at session start** until the id has been confirmed once. The hook
+cannot raise the popup itself — MCP elicitation belongs to the gate and only happens
+inside a tool call — so it emits `additionalContext` asking Claude to call
+`set_identity` immediately, which is what shows the prompt.
+
+`identity.json` carries a `confirmed` flag driving this:
+
+| Popup outcome | `confirmed` | Next session |
+|---|---|---|
+| Accept | true | quiet |
+| Decline (keep current id) | true | quiet |
+| Dismissed without deciding | false | asks again |
+
+Identities created before this flag existed count as unconfirmed, so they get the
+prompt once. Exported `AGENT_ID` is never prompted, since writing the file cannot
+change it.
+
+To change an id later, ask Claude "set my agent id to <name>" (the gate's
+`set_identity` tool). That raises an **approval popup**
+with an editable name field — same out-of-band elicitation the inbox gate uses — so
+the model can only *propose* an id and the user decides. Accept rewrites tier 2 and
+takes effect on the next tool call, no restart. Declining leaves identity untouched.
+
+The rename is gated because identity is what the relay routes on and what appears in
+the recipient's `From:` line: a model that could rename its agent unprompted would
+silently stop receiving on the old id, and could choose who others think it is.
+If the client does not support elicitation, `set_identity` refuses rather than
+renaming unconfirmed.
+
+Note that tier 1 wins: if `AGENT_ID` is exported, `set_identity` writes the file but
+the session keeps using the env value. The popup, the tool result, `whoami`, and the
+SessionStart hook all say so explicitly.
 
 So identity is now per-directory and auto-created; you no longer have to pass
 `AGENT_ID` on every launch. `USER_ID` still falls back to `$USER`; `RELAY_URL`
