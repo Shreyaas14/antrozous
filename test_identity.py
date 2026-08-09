@@ -351,6 +351,87 @@ class SetupPromptTests(IsolatedIdentityTest):
             self.assertFalse(identity.describe(self.project)["needs_setup"])
 
 
+class QualifiedIdTests(unittest.TestCase):
+    """Ids are "<name>.<fingerprint>" so two people sharing a name stay distinct."""
+
+    def test_compose_and_split_roundtrip(self):
+        self.assertEqual(identity.compose_agent_id("Babu", "27uumo4l"), "babu.27uumo4l")
+        self.assertEqual(identity.split_agent_id("babu.27uumo4l"), ("babu", "27uumo4l"))
+        self.assertTrue(identity.is_qualified("babu.27uumo4l"))
+
+    def test_legacy_unqualified_ids_still_parse(self):
+        for legacy in ("agent-9210a9a2e7", "agent-shreyaas", "babu"):
+            self.assertEqual(identity.split_agent_id(legacy), (legacy, None))
+            self.assertFalse(identity.is_qualified(legacy))
+            self.assertEqual(identity.agent_name(legacy), legacy)
+
+    def test_a_dotted_suffix_that_is_not_a_fingerprint_is_not_split(self):
+        # Wrong length, and characters outside base32 must not be read as a
+        # fingerprint, or a name containing a dot would silently lose its tail.
+        for weird in ("foo.bar", "foo.abc", "foo.ABCDEFGH", "foo.abcdef19"):
+            self.assertEqual(identity.split_agent_id(weird), (weird, None))
+
+    def test_compose_without_a_fingerprint_returns_the_bare_name(self):
+        self.assertEqual(identity.compose_agent_id("babu", None), "babu")
+        self.assertEqual(identity.compose_agent_id("babu", "TOO-SHORT"), "babu")
+
+    def test_compose_rejects_an_illegal_name(self):
+        for bad in ("a/b", "", "-x", "x-", "a" * 40, None):
+            self.assertIsNone(identity.compose_agent_id(bad, "27uumo4l"), repr(bad))
+
+    def test_name_normalization_drops_an_existing_fingerprint(self):
+        # Re-typing a full id where a name is expected must not double the suffix.
+        self.assertEqual(identity.normalize_name("Babu.27uumo4l"), "babu")
+
+    def test_qualified_ids_are_legal_agent_ids(self):
+        composed = identity.compose_agent_id("babu", "27uumo4l")
+        self.assertIsNotNone(identity.normalize_agent_id(composed))
+
+    def test_same_name_different_fingerprints_do_not_collide(self):
+        self.assertNotEqual(
+            identity.compose_agent_id("shreyaas", "aaaaaaaa"),
+            identity.compose_agent_id("shreyaas", "bbbbbbbb"),
+        )
+
+
+class FingerprintCacheTests(IsolatedIdentityTest):
+    """The gate computes the fingerprint; crypto-free callers read it back."""
+
+    def test_save_and_read(self):
+        self.assertEqual(identity.save_fingerprint("27uumo4l"), "27uumo4l")
+        self.assertEqual(identity.saved_fingerprint(), "27uumo4l")
+
+    def test_illegal_fingerprints_are_refused(self):
+        for bad in ("", "SHORT", "abcdefg1", "not-base32!", None, 7):
+            self.assertIsNone(identity.save_fingerprint(bad), repr(bad))
+        self.assertIsNone(identity.saved_fingerprint())
+
+    def test_rename_preserves_the_cached_fingerprint(self):
+        # Regression: set_agent_id rebuilt the record and dropped the fingerprint,
+        # leaving the hook unable to build a qualified id.
+        identity.save_fingerprint("27uumo4l")
+
+        identity.set_agent_id(self.project, "babu.27uumo4l")
+
+        self.assertEqual(identity.saved_fingerprint(), "27uumo4l")
+
+    def test_mark_confirmed_preserves_the_cached_fingerprint(self):
+        identity.save_fingerprint("27uumo4l")
+        identity.resolve_agent_id(self.project)
+
+        identity.mark_confirmed(self.project)
+
+        self.assertEqual(identity.saved_fingerprint(), "27uumo4l")
+
+    def test_suggestion_qualifies_a_legacy_id_from_the_cache(self):
+        identity.save_fingerprint("27uumo4l")
+        identity.set_agent_id(self.project, "agent-legacy")
+
+        self.assertEqual(
+            identity.suggest_session_id("agent-legacy"), "agent-legacy.27uumo4l"
+        )
+
+
 class SessionRegistryTests(IsolatedIdentityTest):
     """Per-session ids: each tab registers so the next one is offered a free name."""
 
@@ -422,6 +503,105 @@ class SessionRegistryTests(IsolatedIdentityTest):
 
     def test_sessions_live_under_the_overridable_home(self):
         self.assertTrue(identity.sessions_dir().startswith(self.home))
+
+
+class AccountAddressTests(IsolatedIdentityTest):
+    """The account address is stable across sessions; session addresses vary."""
+
+    def test_account_address_qualifies_the_saved_name(self):
+        identity.save_fingerprint("27uumo4l")
+        identity.set_agent_id(self.project, "shreyaas.27uumo4l")
+
+        self.assertEqual(identity.account_agent_id(self.project), "shreyaas.27uumo4l")
+
+    def test_account_address_is_unchanged_by_session_names(self):
+        identity.save_fingerprint("27uumo4l")
+        identity.set_agent_id(self.project, "shreyaas.27uumo4l")
+        before = identity.account_agent_id(self.project)
+
+        identity.register_session("review.27uumo4l")
+
+        self.assertEqual(identity.account_agent_id(self.project), before)
+
+    def test_account_address_qualifies_a_legacy_saved_id(self):
+        identity.save_fingerprint("27uumo4l")
+        identity.set_agent_id(self.project, "agent-legacy")
+
+        self.assertEqual(
+            identity.account_agent_id(self.project), "agent-legacy.27uumo4l"
+        )
+
+    def test_account_address_survives_a_missing_fingerprint(self):
+        identity.set_agent_id(self.project, "agent-legacy")
+        self.assertEqual(identity.account_agent_id(self.project), "agent-legacy")
+
+
+class PrimarySessionTests(IsolatedIdentityTest):
+    """Exactly one session drains account mail, and the slot is self-healing."""
+
+    def _fake_session(self, pid, agent_id, primary=False):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        record = {"agent_id": agent_id, "pid": pid}
+        if primary:
+            record["primary"] = True
+        with open(os.path.join(identity.sessions_dir(), "%d.json" % pid), "w") as f:
+            json.dump(record, f)
+
+    def test_first_session_claims_the_vacant_slot(self):
+        identity.register_session("a.27uumo4l")
+
+        self.assertTrue(identity.claim_primary())
+        self.assertTrue(identity.is_primary())
+        self.assertEqual(identity.primary_pid(), os.getpid())
+
+    def test_claiming_is_idempotent(self):
+        identity.register_session("a.27uumo4l")
+        identity.claim_primary()
+        self.assertTrue(identity.claim_primary())
+
+    def test_a_second_session_does_not_steal_the_slot(self):
+        # A live holder keeps it, so account mail has exactly one reader.
+        self._fake_session(os.getppid(), "other.27uumo4l", primary=True)
+        identity.register_session("a.27uumo4l")
+
+        self.assertFalse(identity.claim_primary())
+        self.assertFalse(identity.is_primary())
+
+    def test_force_hands_the_slot_over(self):
+        self._fake_session(os.getppid(), "other.27uumo4l", primary=True)
+        identity.register_session("a.27uumo4l")
+
+        self.assertTrue(identity.claim_primary(force=True))
+        self.assertEqual(identity.primary_pid(), os.getpid())
+
+    def test_a_dead_holder_frees_the_slot(self):
+        # The failure mode of a designated primary: it must not strand account mail
+        # when that session exits.
+        self._fake_session(999999, "ghost.27uumo4l", primary=True)
+        identity.register_session("a.27uumo4l")
+
+        self.assertTrue(identity.claim_primary())
+        self.assertTrue(identity.is_primary())
+
+    def test_claiming_without_registering_fails(self):
+        self.assertFalse(identity.claim_primary())
+        self.assertIsNone(identity.primary_pid())
+
+    def test_registration_preserves_the_primary_flag(self):
+        identity.register_session("a.27uumo4l")
+        identity.claim_primary()
+
+        identity.register_session("renamed.27uumo4l")
+
+        self.assertTrue(identity.is_primary())
+
+    def test_unregister_releases_the_slot(self):
+        identity.register_session("a.27uumo4l")
+        identity.claim_primary()
+
+        identity.unregister_session()
+
+        self.assertIsNone(identity.primary_pid())
 
 
 class GitExclusionTests(unittest.TestCase):

@@ -3,6 +3,9 @@
 Antrozous is a Claude Code plugin for sending agent-to-agent messages through a
 relay while keeping inbound content behind an explicit user approval gate.
 
+Message content is encrypted end-to-end: the relay stores only ciphertext it cannot
+read, and each message is signed so a recipient can verify who sent it.
+
 The plugin provides:
 
 - `send_message` — send text or an image/PDF attachment to another agent.

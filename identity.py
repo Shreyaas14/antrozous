@@ -11,6 +11,49 @@ GIT_EXCLUDE_PATTERN = ".antrozous/"
 # Ids are interpolated unescaped into /inbox/<id> and /ws/<id>.
 AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$")
 
+# A qualified id is "<name>.<fingerprint>". The fingerprint is a digest of the
+# agent's identity key, so two people who choose the same name still get different
+# ids instead of silently sharing an inbox.
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}[a-z0-9]$")
+FINGERPRINT_RE = re.compile(r"^[a-z2-7]{8}$")
+
+
+def normalize_name(candidate):
+    """Canonical form of the human-chosen part of an id, or None if illegal."""
+    if not isinstance(candidate, str):
+        return None
+    folded = candidate.strip().lower()
+    if "." in folded:
+        folded = folded.split(".", 1)[0]
+    return folded if NAME_RE.match(folded) else None
+
+
+def compose_agent_id(name, fingerprint):
+    normalized = normalize_name(name)
+    if normalized is None:
+        return None
+    if not (isinstance(fingerprint, str) and FINGERPRINT_RE.match(fingerprint)):
+        return normalized
+    return "%s.%s" % (normalized, fingerprint)
+
+
+def split_agent_id(agent_id):
+    """(name, fingerprint) — fingerprint is None for a legacy unqualified id."""
+    if not isinstance(agent_id, str) or "." not in agent_id:
+        return agent_id, None
+    name, _, tail = agent_id.rpartition(".")
+    if FINGERPRINT_RE.match(tail) and normalize_name(name):
+        return name, tail
+    return agent_id, None
+
+
+def agent_name(agent_id):
+    return split_agent_id(agent_id)[0]
+
+
+def is_qualified(agent_id):
+    return split_agent_id(agent_id)[1] is not None
+
 
 def global_dir():
     return os.environ.get("ANTROZOUS_HOME") or os.path.expanduser("~/.antrozous")
@@ -40,8 +83,8 @@ def _pid_alive(pid):
     return True
 
 
-def live_sessions():
-    """{pid: agent_id} for sessions still running. Prunes dead entries."""
+def session_records():
+    """{pid: record} for sessions still running. Prunes dead entries."""
     out = {}
     try:
         names = os.listdir(sessions_dir())
@@ -63,17 +106,67 @@ def live_sessions():
             continue
         data = _read_json(path)
         if data and data.get("agent_id"):
-            out[pid] = data["agent_id"]
+            out[pid] = data
     return out
 
 
-def register_session(agent_id):
+def live_sessions():
+    """{pid: agent_id} for sessions still running."""
+    return {pid: rec["agent_id"] for pid, rec in session_records().items()}
+
+
+def register_session(agent_id, primary=False):
     os.makedirs(sessions_dir(), exist_ok=True)
-    _write_json(
-        _session_path(),
-        {"agent_id": agent_id, "pid": os.getpid(), "started_at": str(datetime.now())},
+    record = _read_json(_session_path()) or {}
+    record.update(
+        {
+            "agent_id": agent_id,
+            "pid": os.getpid(),
+            "started_at": record.get("started_at") or str(datetime.now()),
+        }
     )
+    if primary:
+        record["primary"] = True
+    _write_json(_session_path(), record)
     return agent_id
+
+
+def primary_pid():
+    for pid, rec in session_records().items():
+        if rec.get("primary"):
+            return pid
+    return None
+
+
+def claim_primary(force=False):
+    """Take the primary slot if it is vacant (or force a handover). Returns True if
+    this process holds it afterwards.
+
+    Claimed opportunistically rather than assigned once, so a closed primary does
+    not strand account mail — the next session to look takes over.
+    """
+    holder = primary_pid()
+    if holder == os.getpid():
+        return True
+    if holder is not None and not force:
+        return False
+    if holder is not None:
+        other = _read_json(_session_path(holder)) or {}
+        other.pop("primary", None)
+        try:
+            _write_json(_session_path(holder), other)
+        except OSError:
+            return False
+    record = _read_json(_session_path())
+    if not (record and record.get("agent_id")):
+        return False
+    record["primary"] = True
+    _write_json(_session_path(), record)
+    return True
+
+
+def is_primary():
+    return primary_pid() == os.getpid()
 
 
 def unregister_session():
@@ -83,16 +176,65 @@ def unregister_session():
         pass
 
 
-def suggest_session_id(base):
-    """base if no live session holds it, else base-2, base-3, …"""
-    taken = set(live_sessions().values())
+def suggest_session_name(base):
+    """base if no live session uses that name, else base-2, base-3, …
+
+    Tabs on one machine share a fingerprint, so distinctness between them has to
+    come from the name.
+    """
+    base = normalize_name(base) or "agent"
+    taken = {agent_name(a) for a in live_sessions().values()}
     if base not in taken:
         return base
     for n in range(2, 100):
-        candidate = normalize_agent_id("%s-%d" % (base, n))
+        candidate = normalize_name("%s-%d" % (base, n))
         if candidate and candidate not in taken:
             return candidate
-    return normalize_agent_id("%s-%s" % (base, secrets.token_hex(2))) or base
+    return normalize_name("%s-%s" % (base, secrets.token_hex(2))) or base
+
+
+def suggest_session_id(base):
+    """A free, fully qualified id derived from `base`.
+
+    Falls back to the cached fingerprint when `base` is an unqualified legacy id, so
+    the suggestion is collision-proof even before the id has been migrated.
+    """
+    name, fp = split_agent_id(base)
+    suggested = suggest_session_name(name)
+    return compose_agent_id(suggested, fp or saved_fingerprint()) or suggested
+
+
+def account_agent_id(base_dir):
+    """The stable address to hand to other people.
+
+    Built from the SAVED default name plus this device's fingerprint, so it is the
+    same in every session. Session addresses vary by name; this one does not.
+    """
+    saved = resolve_agent_id(base_dir)
+    name, fp = split_agent_id(saved)
+    return compose_agent_id(name, fp or saved_fingerprint()) or saved
+
+
+def saved_fingerprint():
+    return (_read_json(_global_path()) or {}).get("fingerprint")
+
+
+def save_fingerprint(fp):
+    """Cache the gate's key fingerprint so crypto-free callers can build full ids."""
+    if not (isinstance(fp, str) and FINGERPRINT_RE.match(fp)):
+        return None
+    path = _global_path()
+    record = _read_json(path) or {}
+    if record.get("fingerprint") == fp:
+        return fp
+    os.makedirs(global_dir(), exist_ok=True)
+    record["fingerprint"] = fp
+    if not record.get("agent_id"):
+        record["agent_id"] = suggest_agent_id(scope="global")
+        record.setdefault("created_at", str(datetime.now()))
+        record.setdefault("confirmed", False)
+    _write_json(path, record)
+    return fp
 
 
 def _identity_path(base_dir):
@@ -177,6 +319,11 @@ def suggest_agent_id(base_dir=None, scope="global"):
 
 def _write_identity(path, agent_id, previous=None, confirmed=True):
     record = {"agent_id": agent_id, "confirmed": bool(confirmed)}
+    # The fingerprint is cached here for crypto-free readers; a rename must not drop
+    # it or the hook loses the ability to build qualified ids.
+    existing = previous if previous is not None else _read_json(path)
+    if existing and existing.get("fingerprint"):
+        record["fingerprint"] = existing["fingerprint"]
     if previous and previous.get("created_at"):
         record["created_at"] = previous["created_at"]
         record["renamed_at"] = str(datetime.now())
