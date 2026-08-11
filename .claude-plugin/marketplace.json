@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "antrozous",
+  "description": "Agent-to-agent message relay with an approval gate for isolated inbound messages",
+  "owner": {
+    "name": "Shreyaas14"
+  },
+  "plugins": [
+    {
+      "name": "antrozous",
+      "description": "Send and approve isolated agent-to-agent messages through the antrozous relay.",
+      "author": {
+        "name": "Shreyaas14"
+      },
+      "category": "productivity",
+      "source": "./",
+      "homepage": "https://github.com/Shreyaas14/antrozous"
+    }
+  ]
+}
