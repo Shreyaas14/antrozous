@@ -39,5 +39,13 @@ class Message(BaseModel):
 
 
 class KeyBundle(BaseModel):
+    """Public half of a device's keys.
+
+    `signature` is only needed to ROTATE an already-registered x25519 key: it is an
+    Ed25519 signature by the registered identity key over keyreg_bytes(). First
+    registration needs none, and a changed ed25519 is refused outright.
+    """
+
     ed25519: str
     x25519: str
+    signature: Optional[str] = None

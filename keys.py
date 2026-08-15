@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 
 import identity
 
@@ -18,6 +19,10 @@ KEY_VERSION = 1
 SEAL_VERSION = b"\x01"
 _SEAL_INFO = b"antrozous-seal-v1"
 FINGERPRINT_CHARS = 8
+
+# Relay request auth. Must stay byte-identical to the server's copy in server.py.
+AUTH_SCHEME = "Antrozous"
+AUTH_CONTEXT = "antrozous-auth-v1"
 
 
 class CryptoError(Exception):
@@ -210,6 +215,33 @@ def verify(ed25519_public_b64, signature_b64, data):
     if len(public) != 32 or len(signature) != 64:
         return False
     return _ed_verify(public, signature, data)
+
+
+def auth_bytes(method, path, agent_id, ts, nonce):
+    """Canonical bytes covering a relay request. Mirrors server.auth_bytes exactly."""
+    return "\n".join([AUTH_CONTEXT, method.upper(), path, agent_id, ts, nonce]).encode()
+
+
+def auth_header(agent_id, method, path, record=None):
+    """Prove possession of this device's identity key for one request.
+
+    The public key travels with the signature so the relay can check it against the
+    fingerprint in `agent_id` without a directory lookup — the address itself is the
+    assertion. `path` must include the query string, or a consume's `count` would
+    not be covered.
+    """
+    record = record or load_or_create()
+    ts = "%d" % int(time.time())
+    nonce = base64.b16encode(os.urandom(12)).decode().lower()
+    signature = sign(auth_bytes(method, path, agent_id, ts, nonce), record)
+    return "%s %s:%s:%s:%s:%s" % (
+        AUTH_SCHEME,
+        agent_id,
+        ts,
+        nonce,
+        public_bundle(record)["ed25519"],
+        signature,
+    )
 
 
 def _seal_key(shared, eph_pub, recipient_pub):

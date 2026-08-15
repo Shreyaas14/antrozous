@@ -138,15 +138,31 @@ def read_message():
 
 
 # ---------- relay HTTP (stdlib only) ----------
-def http(method, path, body=None):
+def http(method, path, body=None, as_agent=None):
+    """Call the relay, signing the request when `as_agent` is given.
+
+    Everything that touches a message — read, consume, send — is signed. Key lookups
+    stay unsigned: a sender has to fetch a recipient's public key before it has any
+    relationship to prove.
+    """
     url = RELAY_URL + path
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, method=method, headers={"content-type": "application/json"}
-    )
+    headers = {"content-type": "application/json"}
+    if as_agent and KEYS_AVAILABLE:
+        headers["authorization"] = keys.auth_header(as_agent, method, path)
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read().decode()
     return json.loads(raw) if raw else None
+
+
+def _blob_headers(method, path, content_type=None):
+    headers = {"content-type": content_type} if content_type else {}
+    if KEYS_AVAILABLE:
+        # Blobs belong to no inbox, so we authenticate as ourselves; the relay only
+        # needs to know the caller holds SOME identity.
+        headers["authorization"] = keys.auth_header(current_agent_id(), method, path)
+    return headers
 
 
 def put_blob(raw):
@@ -157,7 +173,7 @@ def put_blob(raw):
         RELAY_URL + "/blob",
         data=raw,
         method="PUT",
-        headers={"content-type": "application/octet-stream"},
+        headers=_blob_headers("PUT", "/blob", "application/octet-stream"),
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
@@ -165,7 +181,10 @@ def put_blob(raw):
 
 def get_blob(sha256):
     """Fetch raw bytes for a stored blob by hash. Caller MUST verify the hash."""
-    req = urllib.request.Request(RELAY_URL + "/blob/" + sha256, method="GET")
+    path = "/blob/" + sha256
+    req = urllib.request.Request(
+        RELAY_URL + path, method="GET", headers=_blob_headers("GET", path)
+    )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read()
 
@@ -300,6 +319,74 @@ def publish_keys(account_id):
     except (urllib.error.URLError, keys.CryptoError, OSError) as e:
         log("key publish failed:", e)
     return False
+
+
+def _peers_path():
+    return os.path.join(identity.global_dir(), "peers.json")
+
+
+def _read_peers():
+    return identity._read_json(_peers_path()) or {}
+
+
+def _pin_peer(name, fingerprint):
+    peers = _read_peers()
+    if peers.get(name) == fingerprint:
+        return
+    peers[name] = fingerprint
+    os.makedirs(identity.global_dir(), exist_ok=True)
+    identity._write_json(_peers_path(), peers)
+
+
+def resolve_peer(agent_id):
+    """(canonical_id, reason) — expand a bare name into '<name>.<fingerprint>'.
+
+    The mapping is PINNED locally on first use. A name that later resolves to a
+    different fingerprint is a hard error, never a silent re-trust: that is the one
+    thing the relay could otherwise lie about, since a bare name carries no digest
+    to check against.
+    """
+    name, fp = identity.split_agent_id(agent_id)
+    if fp:
+        # Already qualified — nothing to resolve, but remember it so the short form
+        # works later without asking the relay.
+        _pin_peer(name, fp)
+        return agent_id, None
+
+    pinned = _read_peers().get(name)
+    try:
+        answer = http("GET", "/resolve/%s" % name)
+    except urllib.error.HTTPError as e:
+        if pinned:
+            # Relay cannot answer, but we already know who this is.
+            return identity.compose_agent_id(name, pinned), None
+        if e.code == 404:
+            return None, (
+                "no agent has claimed the name '%s' on this relay. Ask them for "
+                "their full '<name>.<fingerprint>' address." % name
+            )
+        return None, "relay returned HTTP %d resolving '%s'" % (e.code, name)
+    except urllib.error.URLError as e:
+        if pinned:
+            return identity.compose_agent_id(name, pinned), None
+        return None, "could not reach the relay to resolve '%s' (%s)" % (name, e)
+
+    fingerprint = (answer or {}).get("fingerprint")
+    if not fingerprint:
+        return None, "the relay returned an unusable answer for '%s'" % name
+    if pinned and pinned != fingerprint:
+        log(
+            "REPOINTED alias %s: pinned %s, relay says %s" % (name, pinned, fingerprint)
+        )
+        return None, (
+            "ALIAS REPOINTED — '%s' resolved to %s the first time you used it, and "
+            "the relay now says %s. Someone may be trying to take over that name. "
+            "Use the full '<name>.<fingerprint>' address you trust, or delete the "
+            "entry in %s if you know the change is legitimate."
+            % (name, pinned, fingerprint, _peers_path())
+        )
+    _pin_peer(name, fingerprint)
+    return identity.compose_agent_id(name, fingerprint), None
 
 
 def fetch_peer_keys(agent_id):
@@ -571,6 +658,15 @@ def do_send(_id, args):
     if not to_agent:
         tool_result(_id, "send_message requires a non-empty 'to_agent'.", is_error=True)
         return
+    # A bare name is expanded to its qualified form BEFORE anything else, so the rest
+    # of the send path only ever sees an address with a key digest in it.
+    resolved, why_not = resolve_peer(to_agent)
+    if resolved is None:
+        tool_result(_id, "Cannot address %s.\n%s" % (to_agent, why_not), is_error=True)
+        return
+    if resolved != to_agent:
+        log("resolved alias %s -> %s" % (to_agent, resolved))
+    to_agent = resolved
     # A message must carry SOMETHING — text, a file, or both.
     if not content and not path:
         tool_result(
@@ -703,7 +799,7 @@ def do_send(_id, args):
         }
 
     try:
-        res = http("POST", "/send", payload)
+        res = http("POST", "/send", payload, as_agent=agent_id)
     except urllib.error.URLError as e:
         tool_result(
             _id, "Could not reach relay at %s (%s)." % (RELAY_URL, e), is_error=True
@@ -830,7 +926,7 @@ def do_check(_id, _args):
     fetched = []
     for addr in addresses:
         try:
-            fetched.append((addr, http("GET", "/inbox/%s" % addr) or []))
+            fetched.append((addr, http("GET", "/inbox/%s" % addr, as_agent=addr) or []))
         except urllib.error.URLError as e:
             tool_result(
                 _id, "Could not reach relay at %s (%s)." % (RELAY_URL, e), is_error=True
@@ -936,7 +1032,8 @@ def do_check(_id, _args):
         if not decided:
             continue
         try:
-            http("POST", "/inbox/%s/consume?count=%d" % (addr, decided))
+            path = "/inbox/%s/consume?count=%d" % (addr, decided)
+            http("POST", path, as_agent=addr)
         except urllib.error.URLError as e:
             log("consume failed for %s:" % addr, e)
 
@@ -991,12 +1088,30 @@ def do_check(_id, _args):
     )
 
 
+def _ws_ticket(agent_id):
+    """Mint a short-lived token that lets a generic client hold the doorbell open.
+
+    A Monitor cannot sign a WebSocket handshake, so the signature happens once here
+    and the socket carries the resulting opaque token instead.
+    """
+    if not KEYS_AVAILABLE:
+        return None
+    try:
+        res = http("POST", "/auth/ticket?agent_id=" + agent_id, {}, as_agent=agent_id)
+        return (res or {}).get("ticket")
+    except (urllib.error.URLError, OSError, keys.CryptoError) as e:
+        log("could not mint ws ticket for %s:" % agent_id, e)
+        return None
+
+
 def _ws_url(agent_id):
-    return (
+    base = (
         RELAY_URL.replace("https://", "wss://").replace("http://", "ws://")
         + "/ws/"
         + agent_id
     )
+    ticket = _ws_ticket(agent_id)
+    return base + ("?ticket=" + ticket) if ticket else base
 
 
 def do_whoami(_id, _args):
