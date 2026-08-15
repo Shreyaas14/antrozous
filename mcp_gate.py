@@ -630,18 +630,34 @@ def _handle_startup_reply(m):
         _publish_account_keys()
         return True
 
+    # Other tabs open RIGHT NOW, checked before we register this one. With peers
+    # around, a custom name means "name this tab"; alone, it means "this is me".
+    peers = {p for p in identity.live_sessions() if p != os.getpid()}
+
     full_id = identity.compose_agent_id(name, _startup_fingerprint) or name
     _adopt_session_id(full_id)
     info = identity.describe(base_dir)
-    # First deliberate choice also becomes the saved default that later suggestions
-    # derive from; after that, accepting only affects this session.
-    if info["needs_setup"]:
+
+    # Renaming has to reach the SAVED default, not just this session: sends,
+    # key publishing and the alias all derive from the account address, so a
+    # session-only rename leaves you telling people a name you never send from.
+    typed_a_different_name = (
+        isinstance(typed, str)
+        and typed.strip() != ""
+        and name != identity.normalize_name(_startup_suggested)
+    )
+    if info["needs_setup"] or (typed_a_different_name and not peers):
         try:
             identity.set_agent_id(
                 base_dir, full_id, drop_project_override=info["source"] == "project"
             )
         except (ValueError, OSError) as e:
             log("could not save default id:", e)
+    elif typed_a_different_name:
+        log(
+            "session named %s; account address stays %s (other tabs are open)"
+            % (full_id, account_agent_id())
+        )
     log("session id set to", full_id)
     # AFTER the saved default is written: the account address derives from it, and
     # publishing earlier would advertise keys under the pre-rename address.
@@ -1140,6 +1156,15 @@ def do_whoami(_id, _args):
         "ws_url": _ws_url(agent_id),
         "account_ws_url": _ws_url(account),
     }
+    if account != agent_id:
+        # Sends, key publishing and the alias all use the ACCOUNT address, so a
+        # differing session name is exactly the state where someone hands out a
+        # name nobody ever sees on their messages. Say it outright.
+        out["note"] = (
+            "This session is named %s, but your messages go out as %s — that is the "
+            "address to give people. Rename the account with set_identity if you "
+            "wanted %s to be your real address." % (agent_id, account, agent_id)
+        )
     if KEYS_AVAILABLE:
         out["key_backend"] = keys.BACKEND
     peers = {p: a for p, a in identity.live_sessions().items() if p != os.getpid()}
