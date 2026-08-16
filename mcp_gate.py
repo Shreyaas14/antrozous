@@ -296,15 +296,21 @@ def _publish_identities():
     Messages carry the SESSION id as their return address, so that id has to be
     resolvable and encryptable too — otherwise replying to a tab silently falls
     back to plaintext, or fails to resolve by bare name.
+
+    Published EVERY time rather than once per process. The relay keeps this in
+    memory, so a redeploy drops every key and alias; a gate that remembered it had
+    already published would never notice, and would sit there while every message to
+    it quietly downgraded to plaintext and its alias sat unclaimed. Republishing is
+    idempotent and one small POST, which is a cheap price for self-healing.
     """
     ok = True
     for address in dict.fromkeys([account_agent_id(), current_agent_id()]):
-        if address in _published:
-            continue
         if publish_keys(address):
-            _published.add(address)
-            log("published keys for", address)
+            if address not in _published:
+                _published.add(address)
+                log("published keys for", address)
         else:
+            _published.discard(address)
             ok = False
     return ok
 

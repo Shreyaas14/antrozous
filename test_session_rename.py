@@ -28,12 +28,17 @@ class SessionRenameTest(unittest.TestCase):
 
         self.base = tempfile.mkdtemp()
         # The gate publishes keys after a rename; that is network and not under test.
+        # Kept so the one test that IS about publishing can call the real thing.
+        self.real_publish_identities = mcp_gate._publish_identities
         self.gate._publish_identities = lambda: True
         self.gate.SESSION_AGENT_ID = None
         self.gate._startup_fingerprint = "kbjz3w4a"
         self.identity.find_directory = lambda: self.base
 
     def tearDown(self):
+        # Put the module back, or the next setUp captures THIS test's stub as the
+        # "real" function and every later test silently exercises a lambda.
+        self.gate._publish_identities = self.real_publish_identities
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.base, ignore_errors=True)
         os.environ.pop("ANTROZOUS_HOME", None)
@@ -115,6 +120,21 @@ class SessionRenameTest(unittest.TestCase):
 
         self.assertEqual(self.saved(), "agent-anish.kbjz3w4a")
         self.assertEqual(published, ["agent-anish.kbjz3w4a"])
+
+    def test_publishing_retries_after_the_relay_loses_state(self):
+        """The relay stores keys in memory, so a redeploy drops them all.
+
+        A gate that published once and remembered it would never notice, and every
+        message to it would silently downgrade to plaintext.
+        """
+        published = []
+        self.gate.publish_keys = lambda addr: published.append(addr) or True
+        self.gate._published.clear()
+
+        # Account and session are the same id here, so one publish per call.
+        self.real_publish_identities()
+        self.real_publish_identities()
+        self.assertEqual(len(published), 2, "must republish, not skip")
 
     def test_whoami_flags_the_mismatch(self):
         self.reply("anish-bot", suggested="agent-shreyaas")
