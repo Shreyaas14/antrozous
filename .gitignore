@@ -18,3 +18,7 @@ messages.json
 
 # Per-project antrozous identity (runtime state, never source)
 .antrozous/
+
+# Xcode build state for the enclave helper
+helper/AntrozousHelper.xcodeproj/xcuserdata/
+helper/AntrozousHelper.xcodeproj/project.xcworkspace/

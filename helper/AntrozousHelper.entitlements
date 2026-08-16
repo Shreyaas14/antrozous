@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The whole reason this target exists. keychain-access-groups is a RESTRICTED
+	     entitlement: macOS kills the process at exec unless a provisioning profile
+	     authorises it, which is why a bare codesigned executable cannot work and
+	     this has to be an .app bundle carrying embedded.provisionprofile.
+	     Xcode substitutes AppIdentifierPrefix with the team id at build time. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.antrozous.helper</string>
+	</array>
+</dict>
+</plist>

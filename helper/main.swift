@@ -165,6 +165,21 @@ do {
         // Proves the entitlement works without touching the wrapped file.
         _ = try enclaveKey()
         print("ok biometry=\(REQUIRE_BIOMETRY)")
+    case "reset":
+        // DESTROYS the enclave key. Anything wrapped with it becomes permanently
+        // unopenable, so the gate must re-wrap from plaintext after this. Needed
+        // because the biometry policy is fixed when the key is CREATED — turning
+        // Touch ID on or off means a new key.
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: KEY_TAG,
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw HelperError("could not delete the enclave key: OSStatus \(status)")
+        }
+        print(status == errSecSuccess ? "deleted" : "nothing to delete")
     default:
         fail("unknown command \(args[1])")
     }
