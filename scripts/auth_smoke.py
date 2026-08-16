@@ -114,11 +114,15 @@ def main():
     identity.set_agent_id(identity.global_dir(), renamed)
     mcp_gate._publish_identities()
 
-    listed = mcp_gate.fingerprint_inboxes(renamed)
-    check("relay lists inboxes for my fingerprint", old in listed, repr(listed))
+    stranded = dict(mcp_gate.other_queues())
+    check("the abandoned queue is reported", old in stranded, repr(stranded))
 
     polled = mcp_gate.inbox_addresses()
-    check("primary session polls the abandoned inbox", old in polled, repr(polled))
+    check(
+        "but this session still polls ONLY its own queue",
+        polled == [renamed],
+        repr(polled),
+    )
 
     # Signed AS the abandoned id, which is legal because it ends in the same key
     # digest. Signing as the new id would (correctly) 401.

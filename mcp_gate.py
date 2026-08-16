@@ -315,16 +315,6 @@ def _publish_identities():
     return ok
 
 
-def fingerprint_inboxes(agent_id):
-    """Every inbox on the relay belonging to this device's key."""
-    try:
-        res = http("GET", "/inboxes?agent_id=" + agent_id, as_agent=agent_id)
-    except (urllib.error.URLError, OSError) as e:
-        log("could not list inboxes:", e)
-        return []
-    return [i["agent_id"] for i in (res or {}).get("inboxes", [])]
-
-
 def publish_keys(account_id):
     """Put this device's public keys in the relay's directory."""
     if not KEYS_AVAILABLE or not identity.is_qualified(account_id):
@@ -502,27 +492,38 @@ def account_agent_id():
 
 
 def inbox_addresses():
-    """Addresses this session should poll.
+    """This session polls its own queue and nothing else.
 
-    Always its own. The session holding the primary slot ALSO drains every other
-    inbox this device's key owns — the account address, names left behind by a
-    rename, and tabs that have since closed. Only the primary does it, so a message
-    is still reviewed and approved exactly once.
+    Sessions are isolated on purpose: two tabs on one device are two separate
+    agents, and one must never surface — or consume — the other's mail. A session
+    draining its neighbours would also mean approving messages on their behalf,
+    which is the one decision this gate never takes for you.
+
+    Queues left behind by a rename or a closed tab are NOT swept up here. They are
+    reported by other_queues() and drained only when the user asks.
+    """
+    return [current_agent_id()]
+
+
+def other_queues():
+    """(agent_id, pending) for this device's OTHER queues that hold mail.
+
+    Renaming a session, or closing one someone had replied to, leaves a queue that
+    nothing polls. Silently draining it would break session isolation; leaving it
+    invisible is how eleven messages piled up unnoticed. So: surface it, drain it
+    only on request.
     """
     session = current_agent_id()
-    addresses = [session]
-    if not identity.claim_primary():
-        return addresses
-
-    account = account_agent_id()
-    if account != session:
-        addresses.append(account)
-    # Ask the relay rather than guessing: it knows about ids this machine has
-    # forgotten, which is exactly where orphaned mail ends up.
-    for address in fingerprint_inboxes(session):
-        if address not in addresses:
-            addresses.append(address)
-    return addresses
+    try:
+        res = http("GET", "/inboxes?agent_id=" + session, as_agent=session)
+    except (urllib.error.URLError, OSError) as e:
+        log("could not list other queues:", e)
+        return []
+    return [
+        (i["agent_id"], i["pending"])
+        for i in (res or {}).get("inboxes", [])
+        if i["agent_id"] != session and i.get("pending")
+    ]
 
 
 def _adopt_session_id(agent_id):
@@ -992,8 +993,20 @@ def do_check(_id, _args):
 
     total = sum(len(m) for _, m in fetched)
     where = " and ".join(addresses)
+    # Mail sitting in a queue this session does not poll — a name you renamed away
+    # from, or a tab someone replied to that has since closed. Reported, never read:
+    # draining it here would mean deciding on another session's messages.
+    stranded = other_queues()
+    note = ""
+    if stranded:
+        note = (
+            "\n\nOTHER QUEUES on this device are holding mail (not read, not "
+            "consumed — this session only polls its own):\n%s\nAsk to check one by "
+            "name to review it here."
+            % "\n".join("  - %s: %d pending" % (a, n) for a, n in stranded)
+        )
     if not total:
-        tool_result(_id, "Inbox empty for %s." % where)
+        tool_result(_id, "Inbox empty for %s.%s" % (where, note))
         return
     if not CLIENT_ELICITATION:
         tool_result(
@@ -1094,9 +1107,9 @@ def do_check(_id, _args):
         except urllib.error.URLError as e:
             log("consume failed for %s:" % addr, e)
 
-    reject_note = ""
+    reject_note = note
     if rejected:
-        reject_note = (
+        reject_note += (
             "\n\nDISCARDED %d message(s) that failed verification — their content was "
             "NOT decrypted or shown to anyone:\n%s"
             % (
