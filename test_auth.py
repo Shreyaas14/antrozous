@@ -247,6 +247,51 @@ class KeyRegistryTest(unittest.TestCase):
         self.assertFalse(r.json()["rotated"])
 
 
+class MessageLimitsTest(unittest.TestCase):
+    """Message bodies were uncapped, which matters once diffs travel inline."""
+
+    def setUp(self):
+        server.inboxes.clear()
+        server.agent_keys.clear()
+        server._seen_nonces.clear()
+        self.client = TestClient(server.app)
+        self.priv, self.raw, self.pub = _keypair()
+        self.fp = server._fingerprint(self.raw)
+        self.agent = "sender.%s" % self.fp
+
+    def send(self, content):
+        header = _sign(self.priv, self.pub, self.agent, "POST", "/send")
+        return self.client.post(
+            "/send",
+            json={
+                "v": 1,
+                "from_agent": self.agent,
+                "to_agent": "bob.aaaaaaaa",
+                "timestamp": "2026-01-01T00:00:00",
+                "content": content,
+            },
+            headers={"authorization": header},
+        )
+
+    def test_an_ordinary_message_is_fine(self):
+        self.assertEqual(self.send("a patch, say").status_code, 200)
+
+    def test_an_oversized_body_is_refused(self):
+        r = self.send("x" * (server.MAX_MESSAGE_BYTES + 1))
+        self.assertEqual(r.status_code, 413)
+        self.assertEqual(server.inboxes.get("bob.aaaaaaaa", []), [])
+
+    def test_a_full_queue_refuses_rather_than_evicting(self):
+        """Evicting would let a sender push unread messages out of your queue."""
+        server.inboxes["bob.aaaaaaaa"] = [
+            {"n": i} for i in range(server.MAX_INBOX_MESSAGES)
+        ]
+        r = self.send("one more")
+        self.assertEqual(r.status_code, 507)
+        self.assertEqual(len(server.inboxes["bob.aaaaaaaa"]), server.MAX_INBOX_MESSAGES)
+        self.assertEqual(server.inboxes["bob.aaaaaaaa"][0], {"n": 0}, "oldest kept")
+
+
 class InboxListingTest(unittest.TestCase):
     """Renaming or closing a tab must not strand mail."""
 
