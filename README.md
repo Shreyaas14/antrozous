@@ -20,6 +20,22 @@ The plugin provides:
 - `/antrozous:antrozous-inbox` — listen for content-free inbox doorbells and
   invoke the approval gate when one arrives.
 
+Slash commands:
+
+- `/antrozous:send <agent_id> | <message>` — send a message. Omitting the `|` still
+  works but asks you to confirm the parse first. If the message names a file path
+  that exists, it offers to attach it — always behind a confirmation, because an
+  upload cannot be undone.
+- `/antrozous:start` — go online. Arms the doorbell listener, and records that you
+  want it, so it comes back by itself in later sessions.
+- `/antrozous:stop` — go offline and stay offline. Messages sent meanwhile are not
+  lost; they queue on the relay.
+
+The listener re-authenticates and reconnects on its own when the socket drops —
+sleep, network loss, or a relay redeploy — and drains anything that arrived during
+the gap. The WebSocket ticket lasts an hour and dies with the relay process, so
+every reconnect mints a fresh one rather than reusing a saved URL.
+
 ## Try the plugin locally
 
 From the parent directory of this repository:
