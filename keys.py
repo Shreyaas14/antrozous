@@ -272,6 +272,17 @@ def _valid(record):
 # granularity, and it means the keys live in memory for the session either way.
 _unwrapped = None
 
+# How the keys in memory were actually obtained. Reported rather than assumed:
+# the enclave path failing is a SILENT downgrade to the plaintext file otherwise,
+# and "I thought Touch ID was protecting this" is the worst way to be wrong.
+_protection = "unknown"
+_protection_detail = ""
+
+
+def protection():
+    """('secure-enclave'|'file'|'unknown', detail) for the keys in use."""
+    return _protection, _protection_detail
+
 
 def load_or_create():
     """This device's keys, from the enclave-wrapped file if there is one.
@@ -281,14 +292,19 @@ def load_or_create():
     lock yourself out. Deleting key.json is the separate, irreversible step that
     actually buys protection against someone holding your disk.
     """
-    global _unwrapped
+    global _unwrapped, _protection, _protection_detail
     if _valid(_unwrapped):
         return _unwrapped
 
     path = key_path()
     try:
         record = enclave_load()
+        if _valid(record):
+            _protection, _protection_detail = "secure-enclave", "unwrapped key.enc"
+        elif enclave_available():
+            _protection_detail = "no key.enc; run keys.enclave_wrap()"
     except CryptoError as e:
+        _protection_detail = str(e)
         # An unopenable key.enc must NEVER strand you while a plaintext key still
         # exists — a stale wrap (enclave reset, Touch ID re-enrolled) would
         # otherwise brick the gate even though the identity is sitting on disk.
@@ -307,7 +323,10 @@ def load_or_create():
 
     record = identity._read_json(path)
     if _valid(record):
+        _protection = "file"
         return record
+    _protection = "file"
+    _protection_detail = "generated a new key"
     os.makedirs(identity.global_dir(), exist_ok=True)
     record = generate()
     try:

@@ -469,6 +469,26 @@ def ensure_keys():
     return fp
 
 
+def key_protection_line():
+    """One line saying how this session's keys were actually obtained.
+
+    Stated explicitly because the enclave path failing is otherwise a SILENT
+    downgrade to the plaintext file — you would believe Touch ID was protecting
+    your identity while it was sitting readable on disk.
+    """
+    if not KEYS_AVAILABLE:
+        return "AUTH FAILED — no crypto backend (%s)" % KEYS_ERROR
+    how, detail = keys.protection()
+    if how == "secure-enclave":
+        return "AUTH CONFIRMED — keys unwrapped from the Secure Enclave"
+    if keys.enclave_available():
+        return (
+            "AUTH FAILED — enclave helper is installed but was not used (%s); "
+            "running on the plaintext key file" % (detail or "no reason given")
+        )
+    return "AUTH: plaintext key file (no enclave helper installed)"
+
+
 def current_agent_id():
     """This session's own address — what tab-to-tab traffic targets."""
     env = os.environ.get("AGENT_ID", "")
@@ -616,7 +636,15 @@ def offer_identity_setup():
         return
 
     base_dir = identity.find_directory()
-    _startup_fingerprint = ensure_keys()
+    # Use the CACHED fingerprint to build the prompt. Calling ensure_keys() here
+    # would unwrap key.enc, and with an enclave-wrapped key that means a Touch ID
+    # prompt appearing BEFORE the popup that explains why anything is asking —
+    # unlocking should follow the user's Accept, not precede it. The unwrap happens
+    # in _handle_startup_reply instead.
+    #
+    # No cached fingerprint means a first run, where there is no key.enc to unwrap
+    # and generating keys prompts for nothing.
+    _startup_fingerprint = identity.saved_fingerprint() or ensure_keys()
     info = identity.describe(base_dir)
     peers = identity.live_sessions()
     _startup_suggested = identity.suggest_session_name(
@@ -654,6 +682,13 @@ def _handle_startup_reply(m):
     result = m.get("result", {}) or {}
     action = result.get("action", "cancel")
     base_dir = identity.find_directory()
+
+    # NOW unlock — after the user has decided, so a Touch ID prompt follows their
+    # Accept instead of appearing unexplained before it. Runs on decline too:
+    # the session still needs its keys to sign relay requests either way.
+    ensure_keys()
+    log(key_protection_line())
+
     if action != "accept":
         # Fall back to the saved id, and still claim it so a later tab is offered a
         # distinct suggestion rather than the same name.
@@ -1238,6 +1273,7 @@ def do_whoami(_id, _args):
         )
     if KEYS_AVAILABLE:
         out["key_backend"] = keys.BACKEND
+        out["key_protection"] = key_protection_line()
     peers = {p: a for p, a in identity.live_sessions().items() if p != os.getpid()}
     if peers:
         out["other_sessions"] = [
