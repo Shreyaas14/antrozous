@@ -71,19 +71,6 @@ agent_keys: Dict[str, dict] = {}
 # fetches, so a relay that lied here would be caught client-side.
 aliases: Dict[str, str] = {}
 
-# Attachments are capped at PUT time, but message BODIES were not capped at all --
-# /send just appended to an in-memory list. Code diffs travel inline in the body, so
-# that gap stops being theoretical: one large patch, or someone being deliberate,
-# is memory pressure on a store that holds everything in RAM.
-#
-# Generous enough that a real patch fits (diffs.py refuses to inspect over 256 KB,
-# so anything past this was never going to be reviewable anyway).
-MAX_MESSAGE_BYTES = int(os.environ.get("MAX_MESSAGE_BYTES", str(1024 * 1024)))  # 1 MB
-
-# How many messages one inbox may hold. Without it, anyone who can send to you --
-# which is anyone, by design -- can grow your queue without limit.
-MAX_INBOX_MESSAGES = int(os.environ.get("MAX_INBOX_MESSAGES", "500"))
-
 BACKUP_FILE = "messages.json"
 if os.path.exists(BACKUP_FILE):
     with open(BACKUP_FILE) as f:
@@ -588,30 +575,10 @@ async def send_message(msg: Message, request: Request):
     # inbox, they just cannot lie about who they are. A forged from_agent is now
     # rejected at the door instead of being stored and caught client-side.
     require_agent(msg.from_agent, request)
-
-    # mode="json" keeps the datetime as an ISO string so the store stays JSON-safe.
-    stored = msg.model_dump(mode="json")
-    size = len(json.dumps(stored).encode())
-    if size > MAX_MESSAGE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="message is %d bytes; the limit is %d. Large files belong in an "
-            "attachment, which is streamed and capped separately."
-            % (size, MAX_MESSAGE_BYTES),
-        )
-
     if msg.to_agent not in inboxes:
         inboxes[msg.to_agent] = []
-    # Refuse rather than evict. Dropping the oldest would let anyone who can send
-    # to you — anyone, by design — push messages you have not read out of your
-    # queue, which is a silent way to make you miss something.
-    if len(inboxes[msg.to_agent]) >= MAX_INBOX_MESSAGES:
-        raise HTTPException(
-            status_code=507,
-            detail="recipient's queue is full (%d messages); it must be drained "
-            "before it can accept more" % MAX_INBOX_MESSAGES,
-        )
-    inboxes[msg.to_agent].append(stored)
+    # mode="json" keeps the datetime as an ISO string so the store stays JSON-safe.
+    inboxes[msg.to_agent].append(msg.model_dump(mode="json"))
     n = len(inboxes[msg.to_agent])
     # DOORBELL: a NEUTRAL, content-free signal — {type, pending} only. It must NOT
     # contain instructions: a receiver correctly treats channel content as untrusted
