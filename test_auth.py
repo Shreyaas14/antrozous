@@ -247,6 +247,47 @@ class KeyRegistryTest(unittest.TestCase):
         self.assertFalse(r.json()["rotated"])
 
 
+class InboxListingTest(unittest.TestCase):
+    """Renaming or closing a tab must not strand mail."""
+
+    def setUp(self):
+        server.inboxes.clear()
+        server.agent_keys.clear()
+        server._seen_nonces.clear()
+        self.client = TestClient(server.app)
+        self.priv, self.raw, self.pub = _keypair()
+        self.fp = server._fingerprint(self.raw)
+        self.agent = "ssh-reyaas.%s" % self.fp
+        # One current inbox, one left behind by a rename, one stranger's.
+        server.inboxes[self.agent] = [{"content": "new"}]
+        server.inboxes["agent-shreyaas.%s" % self.fp] = [{"c": 1}, {"c": 2}]
+        server.inboxes["someone-else.aaaaaaaa"] = [{"c": 3}]
+
+    def list(self, agent_id=None):
+        agent_id = agent_id or self.agent
+        path = "/inboxes?agent_id=%s" % agent_id
+        header = _sign(self.priv, self.pub, agent_id, "GET", path)
+        return self.client.get(path, headers={"authorization": header})
+
+    def test_lists_every_inbox_for_my_fingerprint(self):
+        body = self.list().json()
+        found = {i["agent_id"]: i["pending"] for i in body["inboxes"]}
+        self.assertEqual(found, {self.agent: 1, "agent-shreyaas.%s" % self.fp: 2})
+
+    def test_never_lists_someone_elses(self):
+        listed = [i["agent_id"] for i in self.list().json()["inboxes"]]
+        self.assertNotIn("someone-else.aaaaaaaa", listed)
+
+    def test_requires_a_signature(self):
+        r = self.client.get("/inboxes?agent_id=%s" % self.agent)
+        self.assertEqual(r.status_code, 401)
+
+    def test_cannot_list_another_fingerprints_inboxes(self):
+        """Signing as yourself must not let you enumerate a different device."""
+        r = self.list(agent_id="someone-else.aaaaaaaa")
+        self.assertEqual(r.status_code, 401)
+
+
 class AliasTest(unittest.TestCase):
     """Bare names: convenient to hand out, never trusted on their own."""
 

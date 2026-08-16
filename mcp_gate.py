@@ -290,16 +290,33 @@ def seal_aad(from_agent, to_agent, timestamp):
 _published = set()
 
 
-def _publish_account_keys():
-    """Advertise this device's keys under its current account address, once."""
-    account = account_agent_id()
-    if account in _published:
-        return True
-    if publish_keys(account):
-        _published.add(account)
-        log("published keys for", account)
-        return True
-    return False
+def _publish_identities():
+    """Advertise this device's keys under BOTH addresses it answers to.
+
+    Messages carry the SESSION id as their return address, so that id has to be
+    resolvable and encryptable too — otherwise replying to a tab silently falls
+    back to plaintext, or fails to resolve by bare name.
+    """
+    ok = True
+    for address in dict.fromkeys([account_agent_id(), current_agent_id()]):
+        if address in _published:
+            continue
+        if publish_keys(address):
+            _published.add(address)
+            log("published keys for", address)
+        else:
+            ok = False
+    return ok
+
+
+def fingerprint_inboxes(agent_id):
+    """Every inbox on the relay belonging to this device's key."""
+    try:
+        res = http("GET", "/inboxes?agent_id=" + agent_id, as_agent=agent_id)
+    except (urllib.error.URLError, OSError) as e:
+        log("could not list inboxes:", e)
+        return []
+    return [i["agent_id"] for i in (res or {}).get("inboxes", [])]
 
 
 def publish_keys(account_id):
@@ -479,14 +496,26 @@ def account_agent_id():
 
 
 def inbox_addresses():
-    """Addresses this session should poll: its own, plus the account address if this
-    session holds the primary slot. Only one session drains account mail, so a
-    message is reviewed and approved exactly once."""
+    """Addresses this session should poll.
+
+    Always its own. The session holding the primary slot ALSO drains every other
+    inbox this device's key owns — the account address, names left behind by a
+    rename, and tabs that have since closed. Only the primary does it, so a message
+    is still reviewed and approved exactly once.
+    """
     session = current_agent_id()
     addresses = [session]
+    if not identity.claim_primary():
+        return addresses
+
     account = account_agent_id()
-    if account != session and identity.claim_primary():
+    if account != session:
         addresses.append(account)
+    # Ask the relay rather than guessing: it knows about ids this machine has
+    # forgotten, which is exactly where orphaned mail ends up.
+    for address in fingerprint_inboxes(session):
+        if address not in addresses:
+            addresses.append(address)
     return addresses
 
 
@@ -623,7 +652,7 @@ def _handle_startup_reply(m):
         # distinct suggestion rather than the same name.
         _adopt_session_id(identity.resolve_agent_id(base_dir))
         log("session id prompt %s; using" % action, SESSION_AGENT_ID)
-        _publish_account_keys()
+        _publish_identities()
         return True
 
     content = result.get("content") or {}
@@ -636,7 +665,7 @@ def _handle_startup_reply(m):
     if name is None:
         log("rejected session name %r; keeping saved id" % chosen_name)
         _adopt_session_id(identity.resolve_agent_id(base_dir))
-        _publish_account_keys()
+        _publish_identities()
         return True
 
     full_id = identity.compose_agent_id(name, _startup_fingerprint) or name
@@ -662,7 +691,7 @@ def _handle_startup_reply(m):
     log("session id set to", full_id)
     # AFTER the saved default is written: the account address derives from it, and
     # publishing earlier would advertise keys under the pre-rename address.
-    _publish_account_keys()
+    _publish_identities()
     return True
 
 
@@ -725,11 +754,16 @@ def do_send(_id, args):
 
     # Retry in case the relay was unreachable at startup; without our key published,
     # nobody can encrypt a reply back to us.
-    _publish_account_keys()
+    _publish_identities()
 
-    # Send from the ACCOUNT address so replies reach any of this device's sessions,
-    # not just this tab (which may be closed by then).
-    agent_id = account_agent_id()
+    # Send from THIS SESSION's address, because that is the inbox this session
+    # actually polls. Sending from the account address made every message advertise
+    # a reply-to the sender was not listening on, which is subtle and silent: the
+    # reply lands, nothing errors, and nobody reads it.
+    #
+    # Replies to a tab that later closes are not lost — the primary session drains
+    # every inbox this device's key owns (see inbox_addresses).
+    agent_id = current_agent_id()
     timestamp = _now_iso()
     peer, why_not = fetch_peer_keys(to_agent)
 
@@ -938,7 +972,7 @@ def open_envelope(m):
 
 
 def do_check(_id, _args):
-    _publish_account_keys()
+    _publish_identities()
     addresses = inbox_addresses()
     fetched = []
     for addr in addresses:
@@ -1360,7 +1394,7 @@ def do_set_identity(_id, args):
     # Publish under the NEW address immediately. Waiting for the next check_inbox
     # leaves a window where you have already told people your new name but nothing
     # has claimed the alias for it, so sends to the bare name fail to resolve.
-    _publish_account_keys()
+    _publish_identities()
 
     msg = "User APPROVED. Agent ID is now %s (saved to %s, %s scope)." % (
         canonical,

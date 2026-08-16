@@ -590,6 +590,33 @@ async def send_message(msg: Message, request: Request):
     return {"status": "sent", "pending": n}
 
 
+@app.get("/inboxes")
+def list_inboxes(request: Request, agent_id: str):
+    """Every inbox on this relay sharing the caller's fingerprint.
+
+    Safe to serve because auth already proves possession of the key all these ids
+    are derived from — nothing here is reachable that the caller could not already
+    authenticate for individually.
+
+    It exists because ids are per-session and per-rename while the KEY is per
+    device: renaming, or closing a tab someone replied to, otherwise leaves mail in
+    an inbox nothing polls, with no error anywhere to notice it by.
+    """
+    require_agent(agent_id, request)
+    match = _QUALIFIED_ID_RE.match(agent_id)
+    if not match:
+        raise _unauthorized()
+    suffix = "." + match.group(1)
+    return {
+        "fingerprint": match.group(1),
+        "inboxes": [
+            {"agent_id": name, "pending": len(msgs)}
+            for name, msgs in inboxes.items()
+            if name.endswith(suffix)
+        ],
+    }
+
+
 @app.get("/inbox/{agent_id}")
 def get_inbox(agent_id: str, request: Request):
     # Non-destructive read: returns the pending messages without clearing them.

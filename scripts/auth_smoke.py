@@ -98,6 +98,33 @@ def main():
     peers["smoke"] = fp
     identity._write_json(mcp_gate._peers_path(), peers)
 
+    # --- rename must not strand mail ---
+    old = agent
+    mcp_gate.http(
+        "POST",
+        "/send",
+        dict(payload, to_agent=old, content="pre-rename"),
+        as_agent=agent,
+    )
+    renamed = identity.compose_agent_id("smoke-renamed", fp)
+    # _adopt_session_id, not a bare assignment: inbox_addresses only sweeps the
+    # other inboxes for the session holding the primary slot, and claiming that
+    # slot requires a registered session record.
+    mcp_gate._adopt_session_id(renamed)
+    identity.set_agent_id(identity.global_dir(), renamed)
+    mcp_gate._publish_identities()
+
+    listed = mcp_gate.fingerprint_inboxes(renamed)
+    check("relay lists inboxes for my fingerprint", old in listed, repr(listed))
+
+    polled = mcp_gate.inbox_addresses()
+    check("primary session polls the abandoned inbox", old in polled, repr(polled))
+
+    # Signed AS the abandoned id, which is legal because it ends in the same key
+    # digest. Signing as the new id would (correctly) 401.
+    left = mcp_gate.http("GET", "/inbox/%s" % old, as_agent=old) or []
+    check("old inbox is still readable after renaming", len(left) >= 1)
+
     health = mcp_gate.http("GET", "/health")
     check(
         "health is not a directory",

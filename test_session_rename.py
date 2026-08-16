@@ -28,7 +28,7 @@ class SessionRenameTest(unittest.TestCase):
 
         self.base = tempfile.mkdtemp()
         # The gate publishes keys after a rename; that is network and not under test.
-        self.gate._publish_account_keys = lambda: True
+        self.gate._publish_identities = lambda: True
         self.gate.SESSION_AGENT_ID = None
         self.gate._startup_fingerprint = "kbjz3w4a"
         self.identity.find_directory = lambda: self.base
@@ -104,7 +104,7 @@ class SessionRenameTest(unittest.TestCase):
         """
         self.reply("anish-bot-1", suggested="agent-shreyaas")
         published = []
-        self.gate._publish_account_keys = lambda: published.append(
+        self.gate._publish_identities = lambda: published.append(
             self.gate.account_agent_id()
         )
         # Renames require the user's approval in a popup; stand in for the tap.
