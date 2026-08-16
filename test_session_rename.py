@@ -7,6 +7,7 @@ you could see — you'd tell people "I'm anish-bot" while every message you sent
 anish-bot-1.
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -150,6 +151,56 @@ class SessionRenameTest(unittest.TestCase):
         self.assertIn("scratch.kbjz3w4a", captured["text"])
         self.assertIn("anish-bot.kbjz3w4a", captured["text"])
         self.assertIn("go out as", captured["text"])
+
+
+class DeclineTest(unittest.TestCase):
+    """Declining the startup prompt means NO id — not a quiet fallback.
+
+    It used to adopt the saved id anyway, so "no thanks" produced an addressable
+    session with a queue, which makes the prompt theatre.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        os.environ["ANTROZOUS_HOME"] = self.home
+        os.environ.pop("AGENT_ID", None)
+        import mcp_gate
+
+        self.gate = mcp_gate
+        self.gate.SESSION_AGENT_ID = None
+        self.gate.SESSION_DECLINED = True
+        self.results = []
+        self.gate.tool_result = lambda _id, text, **kw: self.results.append(
+            (kw.get("is_error", False), text)
+        )
+
+    def tearDown(self):
+        self.gate.SESSION_DECLINED = False
+        shutil.rmtree(self.home, ignore_errors=True)
+        os.environ.pop("ANTROZOUS_HOME", None)
+
+    def test_declined_session_has_no_id(self):
+        self.assertIsNone(self.gate.current_agent_id())
+
+    def test_declined_session_cannot_send(self):
+        self.gate.do_send(1, {"to_agent": "someone.aaaaaaaa", "content": "hi"})
+        self.assertTrue(self.results[-1][0], "must be an error")
+        self.assertIn("no antrozous agent id", self.results[-1][1])
+
+    def test_declined_session_cannot_receive(self):
+        self.gate.do_check(1, {})
+        self.assertTrue(self.results[-1][0], "must be an error")
+
+    def test_whoami_reports_the_decline(self):
+        self.gate.do_whoami(1, {})
+        body = json.loads(self.results[-1][1])
+        self.assertIsNone(body["agent_id"])
+        self.assertTrue(body["declined"])
+
+    def test_set_identity_opts_back_in(self):
+        self.gate._adopt_session_id("later.kbjz3w4a")
+        self.assertEqual(self.gate.current_agent_id(), "later.kbjz3w4a")
+        self.assertFalse(self.gate.SESSION_DECLINED)
 
 
 if __name__ == "__main__":

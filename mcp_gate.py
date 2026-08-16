@@ -262,6 +262,24 @@ _startup_drop_override = False
 # so two sessions can differ without fighting over the same file.
 SESSION_AGENT_ID = None
 
+# Set when the user declines the startup prompt. The session then has no agent id
+# at all — unaddressable, unpublished, no queue — until set_identity opts back in.
+SESSION_DECLINED = False
+
+
+def _needs_identity(_id, action):
+    """True (and reports) when this session declined an id and cannot `action`."""
+    if current_agent_id():
+        return False
+    tool_result(
+        _id,
+        "This session has no antrozous agent id — the startup prompt was declined, "
+        "so it is not addressable and cannot %s. Run set_identity to give it one."
+        % action,
+        is_error=True,
+    )
+    return True
+
 
 def signed_bytes(payload):
     """Canonical bytes covered by the sender's signature.
@@ -490,12 +508,20 @@ def key_protection_line():
 
 
 def current_agent_id():
-    """This session's own address — what tab-to-tab traffic targets."""
+    """This session's own address, or None if it declined one.
+
+    None is a real state, not an error: a session that declined the startup prompt
+    is deliberately not addressable. Callers must handle it rather than substitute
+    a saved id, which would resurrect exactly the "declining still gave me an id"
+    behaviour this exists to prevent.
+    """
     env = os.environ.get("AGENT_ID", "")
     if env.strip():
         return env.strip()
     if SESSION_AGENT_ID:
         return SESSION_AGENT_ID
+    if SESSION_DECLINED:
+        return None
     return identity.resolve_agent_id(identity.find_directory())
 
 
@@ -547,8 +573,10 @@ def other_queues():
 
 
 def _adopt_session_id(agent_id):
-    global SESSION_AGENT_ID
+    global SESSION_AGENT_ID, SESSION_DECLINED
     SESSION_AGENT_ID = agent_id
+    # Taking an id is how you opt back in after declining.
+    SESSION_DECLINED = False
     try:
         identity.register_session(agent_id)
         # Claim the primary slot if vacant, so account mail has a reader.
@@ -683,19 +711,21 @@ def _handle_startup_reply(m):
     action = result.get("action", "cancel")
     base_dir = identity.find_directory()
 
-    # NOW unlock — after the user has decided, so a Touch ID prompt follows their
-    # Accept instead of appearing unexplained before it. Runs on decline too:
-    # the session still needs its keys to sign relay requests either way.
+    if action != "accept":
+        # Declining means NO identity for this session — not a quiet fallback to
+        # the saved one. "No thanks" has to actually opt you out, or the prompt is
+        # theatre. Nothing is registered, nothing is published, no queue exists,
+        # and the keys stay locked, so no fingerprint is demanded either.
+        # set_identity opts back in whenever you want.
+        global SESSION_DECLINED
+        SESSION_DECLINED = True
+        log("session id prompt %s; this session has NO agent id" % action)
+        return True
+
+    # Accepted: unlock now, so the Touch ID prompt follows the decision that
+    # explains it rather than arriving unannounced.
     ensure_keys()
     log(key_protection_line())
-
-    if action != "accept":
-        # Fall back to the saved id, and still claim it so a later tab is offered a
-        # distinct suggestion rather than the same name.
-        _adopt_session_id(identity.resolve_agent_id(base_dir))
-        log("session id prompt %s; using" % action, SESSION_AGENT_ID)
-        _publish_identities()
-        return True
 
     content = result.get("content") or {}
     chosen_name = _startup_suggested
@@ -739,6 +769,8 @@ def _handle_startup_reply(m):
 
 # ---------- tools ----------
 def do_send(_id, args):
+    if _needs_identity(_id, "send messages"):
+        return
     to_agent = (args.get("to_agent") or "").strip()
     to_user = (args.get("to_user") or "").strip()
     content = args.get("content") or ""
@@ -1014,6 +1046,8 @@ def open_envelope(m):
 
 
 def do_check(_id, _args):
+    if _needs_identity(_id, "receive messages"):
+        return
     _publish_identities()
     requested = ((_args or {}).get("agent_id") or "").strip()
     if requested:
@@ -1241,6 +1275,24 @@ def do_whoami(_id, _args):
     # it can never point at a different relay than check_inbox uses.
     info = identity.describe(identity.find_directory())
     agent_id = current_agent_id()
+    if agent_id is None:
+        # Declined at startup. Report the state plainly instead of inventing an id;
+        # everything downstream (ws url, inbox list) would be meaningless.
+        tool_result(
+            _id,
+            json.dumps(
+                {
+                    "agent_id": None,
+                    "declined": True,
+                    "note": "This session declined an agent id, so it is not "
+                    "addressable, has no queue, and its keys are still locked. "
+                    "Run set_identity to give it one.",
+                    "relay_url": RELAY_URL,
+                },
+                indent=2,
+            ),
+        )
+        return
     account = account_agent_id()
     source = (
         "env"
