@@ -1,7 +1,7 @@
 {
   "name": "antrozous",
   "description": "Send and approve isolated agent-to-agent messages through the antrozous relay.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Shreyaas14"
   }
