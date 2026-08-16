@@ -58,25 +58,21 @@ class SessionRenameTest(unittest.TestCase):
         self.reply("anish-bot-1", suggested="agent-shreyaas")
         self.assertEqual(self.saved(), "anish-bot-1.kbjz3w4a")
 
-    def test_typing_a_new_name_renames_the_account(self):
-        """The actual bug: second rename used to change nothing that anyone saw."""
+    def test_later_launches_only_name_the_tab(self):
+        """Anish's bug, now the documented rule rather than an accident.
+
+        Typing a name at launch after the first run must NOT move your address —
+        set_identity is the only thing that renames you.
+        """
         self.reply("anish-bot-1", suggested="agent-shreyaas")
         self.identity.mark_confirmed(self.base)
 
-        self.reply("anish-bot", suggested="anish-bot-1")
-        self.assertEqual(self.saved(), "anish-bot.kbjz3w4a")
-        self.assertEqual(self.gate.SESSION_AGENT_ID, "anish-bot.kbjz3w4a")
-
-    def test_accepting_the_suggestion_does_not_rename(self):
-        self.reply("anish-bot", suggested="agent-shreyaas")
-        self.identity.mark_confirmed(self.base)
-
-        # Handed back exactly what was offered — that is "yes", not "rename me".
-        self.reply("anish-bot", suggested="anish-bot")
-        self.assertEqual(self.saved(), "anish-bot.kbjz3w4a")
+        self.reply("agent-anish", suggested="anish-bot-1")
+        self.assertEqual(self.saved(), "anish-bot-1.kbjz3w4a", "address must not move")
+        self.assertEqual(self.gate.SESSION_AGENT_ID, "agent-anish.kbjz3w4a")
 
     def test_a_second_tab_names_itself_without_renaming_the_account(self):
-        """With other tabs live, a custom name is a tab label, not an identity."""
+        """Two Claude sessions on one machine need distinct session ids."""
         self.reply("anish-bot", suggested="agent-shreyaas")
         self.identity.mark_confirmed(self.base)
 
@@ -85,6 +81,20 @@ class SessionRenameTest(unittest.TestCase):
         )
         self.assertEqual(self.saved(), "anish-bot.kbjz3w4a", "account must not move")
         self.assertEqual(self.gate.SESSION_AGENT_ID, "scratch.kbjz3w4a")
+
+    def test_the_prompt_says_which_one_it_is(self):
+        """The wording has to match the behaviour, or people rename nothing."""
+        info = self.identity.describe(self.base)
+        first, _ = self.gate._session_prompt(info, "agent-shreyaas", "kbjz3w4a", {})
+        self.assertIn("FIRST run", first)
+        self.assertIn("YOUR ADDRESS", first)
+
+        self.reply("anish-bot", suggested="agent-shreyaas")
+        self.identity.mark_confirmed(self.base)
+        info = self.identity.describe(self.base)
+        later, _ = self.gate._session_prompt(info, "anish-bot-2", "kbjz3w4a", {})
+        self.assertIn("THIS TAB only", later)
+        self.assertIn("set_identity", later)
 
     def test_set_identity_publishes_under_the_new_name(self):
         """A rename has to claim the new alias, not wait for the next check_inbox.

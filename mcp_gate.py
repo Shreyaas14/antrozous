@@ -514,10 +514,19 @@ def schedule_identity_setup():
 
 def _session_prompt(info, suggested_name, fp, peers):
     full_id = identity.compose_agent_id(suggested_name, fp) or suggested_name
-    where = (
-        "Applies to THIS session only — other tabs keep their own ids.\n"
-        "Saved name for future sessions: %s" % info["agent_id"]
-    )
+    # First run names YOU; later runs name the tab. Saying "session only" on the
+    # first run was simply false, and saying it quietly on later runs let people
+    # believe they had renamed themselves when they had not.
+    if info["needs_setup"]:
+        where = (
+            "This is your FIRST run, so this name becomes YOUR ADDRESS — the one you "
+            "give other people. You can change it later with the set_identity tool."
+        )
+    else:
+        where = (
+            "Names THIS TAB only. Your address stays %s no matter what you type here "
+            "— use the set_identity tool to change that." % info["agent_id"]
+        )
     peer_note = ""
     if peers:
         peer_note = "\n\nOther sessions running right now:\n" + "\n".join(
@@ -630,32 +639,24 @@ def _handle_startup_reply(m):
         _publish_account_keys()
         return True
 
-    # Other tabs open RIGHT NOW, checked before we register this one. With peers
-    # around, a custom name means "name this tab"; alone, it means "this is me".
-    peers = {p for p in identity.live_sessions() if p != os.getpid()}
-
     full_id = identity.compose_agent_id(name, _startup_fingerprint) or name
     _adopt_session_id(full_id)
     info = identity.describe(base_dir)
 
-    # Renaming has to reach the SAVED default, not just this session: sends,
-    # key publishing and the alias all derive from the account address, so a
-    # session-only rename leaves you telling people a name you never send from.
-    typed_a_different_name = (
-        isinstance(typed, str)
-        and typed.strip() != ""
-        and name != identity.normalize_name(_startup_suggested)
-    )
-    if info["needs_setup"] or (typed_a_different_name and not peers):
+    # The FIRST run names you; every launch after that names the tab. Renaming your
+    # actual address is set_identity's job, deliberately — a name typed at launch
+    # should never silently become the address you hand out, and sessions have to be
+    # free to differ so agents on one machine can message each other.
+    if info["needs_setup"]:
         try:
             identity.set_agent_id(
                 base_dir, full_id, drop_project_override=info["source"] == "project"
             )
         except (ValueError, OSError) as e:
             log("could not save default id:", e)
-    elif typed_a_different_name:
+    elif full_id != account_agent_id():
         log(
-            "session named %s; account address stays %s (other tabs are open)"
+            "session named %s; account address stays %s (set_identity to change it)"
             % (full_id, account_agent_id())
         )
     log("session id set to", full_id)
