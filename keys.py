@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import time
 
 import identity
@@ -120,6 +121,113 @@ def key_path():
     return os.path.join(identity.global_dir(), "key.json")
 
 
+def wrapped_path():
+    return os.path.join(identity.global_dir(), "key.enc")
+
+
+def helper_path():
+    """The signed bundle that can talk to the Secure Enclave.
+
+    Built by scripts/build-helper.sh. Absent on Linux, on Macs without Xcode, and
+    on any machine where nobody has opted in — all of which fall back to the plain
+    key file rather than failing.
+    """
+    return os.path.join(
+        identity.global_dir(),
+        "AntrozousHelper.app",
+        "Contents",
+        "MacOS",
+        "AntrozousHelper",
+    )
+
+
+def _helper(*args):
+    """Run the helper. Returns its stdout, or None if it is unavailable.
+
+    Never raises: every caller has a working fallback, and an enclave that is
+    missing, cancelled or broken must degrade to the key file rather than locking
+    someone out of their own identity.
+    """
+    binary = helper_path()
+    if not os.path.exists(binary):
+        return None
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            [binary] + list(args), capture_output=True, text=True, timeout=120
+        )
+    except (OSError, ValueError) as e:
+        raise CryptoError("could not run the enclave helper: %s" % e)
+    if out.returncode != 0:
+        raise CryptoError((out.stderr or out.stdout or "").strip() or "helper failed")
+    return out.stdout.strip()
+
+
+def _wrap_key(secret):
+    return _hkdf(secret, b"antrozous-wrap-v1")
+
+
+def enclave_available():
+    return os.path.exists(helper_path())
+
+
+def enclave_load():
+    """Unwrap key.enc using the enclave, or None if that is not possible.
+
+    Prompts for Touch ID when the helper was built with biometry required.
+    """
+    blob = identity._read_json(wrapped_path())
+    if not (blob and blob.get("peer") and blob.get("sealed")):
+        return None
+    secret = _helper("derive", blob["peer"])
+    if not secret:
+        return None
+    nonce, ct = _unb64(blob["sealed"])[:12], _unb64(blob["sealed"])[12:]
+    try:
+        raw = _aead_decrypt(_wrap_key(_unb64(secret)), nonce, ct, b"antrozous-wrap-v1")
+    except Exception as e:
+        raise CryptoError(
+            "key.enc did not decrypt (%s). The enclave key was probably reset or "
+            "the Touch ID enrolment changed, which destroys the wrapping key." % e
+        )
+    return json.loads(raw.decode())
+
+
+def enclave_wrap(record=None):
+    """Write key.enc from the current keys. Leaves key.json alone.
+
+    Deliberately non-destructive: while both files exist the enclave path can be
+    tested and abandoned freely. Removing key.json is the separate step that makes
+    the protection real, and the point of no return if the enclave is ever lost.
+    """
+    if not enclave_available():
+        raise CryptoError(
+            "no enclave helper at %s — run scripts/build-helper.sh" % helper_path()
+        )
+    record = record or load_or_create()
+    peer = _helper("init")
+    secret = _helper("derive", peer)
+    nonce = os.urandom(12)
+    plaintext = json.dumps(
+        {
+            "version": record.get("version", KEY_VERSION),
+            "ed25519_private": record["ed25519_private"],
+            "x25519_private": record["x25519_private"],
+        }
+    ).encode()
+    sealed = nonce + _aead_encrypt(
+        _wrap_key(_unb64(secret)), nonce, plaintext, b"antrozous-wrap-v1"
+    )
+    path = wrapped_path()
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"peer": peer, "sealed": _b64(sealed)}, f)
+    os.replace(tmp, path)
+    return path
+
+
 def _b64(raw):
     return base64.b64encode(raw).decode()
 
@@ -152,10 +260,53 @@ def generate():
     }
 
 
+def _valid(record):
+    return bool(
+        record and record.get("ed25519_private") and record.get("x25519_private")
+    )
+
+
+# Unwrapped once per process. The gate has to decrypt unattended to render the
+# approval popup, so asking the enclave per operation would mean a fingerprint per
+# doorbell — including at 3am. One tap per gate start is the only bearable
+# granularity, and it means the keys live in memory for the session either way.
+_unwrapped = None
+
+
 def load_or_create():
+    """This device's keys, from the enclave-wrapped file if there is one.
+
+    Order matters: wrapped first, plaintext second. While both exist the plaintext
+    is a deliberate fallback — you can test the enclave path without being able to
+    lock yourself out. Deleting key.json is the separate, irreversible step that
+    actually buys protection against someone holding your disk.
+    """
+    global _unwrapped
+    if _valid(_unwrapped):
+        return _unwrapped
+
     path = key_path()
+    try:
+        record = enclave_load()
+    except CryptoError as e:
+        # An unopenable key.enc must NEVER strand you while a plaintext key still
+        # exists — a stale wrap (enclave reset, Touch ID re-enrolled) would
+        # otherwise brick the gate even though the identity is sitting on disk.
+        # Only once key.json is gone is this genuinely fatal.
+        if not _valid(identity._read_json(path)):
+            raise
+        print(
+            "[antrozous-keys] key.enc could not be opened (%s); falling back to "
+            "key.json. Re-wrap with keys.enclave_wrap() to use the enclave again." % e,
+            file=sys.stderr,
+        )
+        record = None
+    if _valid(record):
+        _unwrapped = record
+        return record
+
     record = identity._read_json(path)
-    if record and record.get("ed25519_private") and record.get("x25519_private"):
+    if _valid(record):
         return record
     os.makedirs(identity.global_dir(), exist_ok=True)
     record = generate()
@@ -168,7 +319,7 @@ def load_or_create():
         return record
     except FileExistsError:
         existing = identity._read_json(path)
-        if not (existing and existing.get("ed25519_private")):
+        if not _valid(existing):
             raise CryptoError("key file at %s is unreadable" % path)
         return existing
 
