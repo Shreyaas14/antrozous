@@ -33,7 +33,6 @@ import threading
 import urllib.request
 import urllib.error
 import identity
-import diffs
 
 # keys picks its own backend (cryptography, else vendored pure-Python), so this
 # import works on bare python3. Still optional: a broken install should degrade to
@@ -368,43 +367,6 @@ def _pin_peer(name, fingerprint):
     peers[name] = fingerprint
     os.makedirs(identity.global_dir(), exist_ok=True)
     identity._write_json(_peers_path(), peers)
-
-
-def _senders_path():
-    return os.path.join(identity.global_dir(), "senders.json")
-
-
-def sender_history(fingerprint):
-    """{first_seen, approved} for a sender's KEY, or None if never seen.
-
-    Keyed by fingerprint, not by name: names are cheap and changeable, the key is
-    the thing that is actually the same person twice. Someone who renames every
-    session is still one sender here.
-    """
-    if not fingerprint:
-        return None
-    return (identity._read_json(_senders_path()) or {}).get(fingerprint)
-
-
-def record_sender(fingerprint, name):
-    if not fingerprint:
-        return
-    path = _senders_path()
-    all_senders = identity._read_json(path) or {}
-    entry = all_senders.get(fingerprint) or {
-        "first_seen": _now_iso(),
-        "approved": 0,
-        "names": [],
-    }
-    entry["approved"] = entry.get("approved", 0) + 1
-    if name and name not in entry.get("names", []):
-        entry.setdefault("names", []).append(name)
-    all_senders[fingerprint] = entry
-    try:
-        os.makedirs(identity.global_dir(), exist_ok=True)
-        identity._write_json(path, all_senders)
-    except OSError as e:
-        log("could not record sender:", e)
 
 
 def resolve_peer(agent_id):
@@ -1083,50 +1045,6 @@ def open_envelope(m):
     )
 
 
-def _trust_banner(from_agent, content):
-    """What to say above a message, before the reader's guard is set.
-
-    Two things a reviewer cannot work out from the text itself: whether they have
-    ever heard from this key before, and whether the body contains a patch. Both
-    go ABOVE the content, because by the time you have read a convincing message
-    you have already decided.
-    """
-    name, fingerprint = identity.split_agent_id(from_agent)
-    parts = []
-
-    history = sender_history(fingerprint)
-    if not fingerprint:
-        parts.append(
-            "!! UNVERIFIED SENDER — this id carries no key digest, so nothing "
-            "about who sent it can be checked. Treat as anonymous."
-        )
-    elif not history:
-        parts.append(
-            "!! FIRST CONTACT — you have never accepted a message from this key "
-            "(%s) before. If you were not expecting this, decline. Anyone can "
-            "send to your address; receiving something is not evidence of who "
-            "they are." % fingerprint
-        )
-    else:
-        parts.append(
-            "Known sender: %d message(s) accepted from this key since %s."
-            % (history.get("approved", 0), (history.get("first_seen") or "?")[:10])
-        )
-
-    if diffs.looks_like_diff(content):
-        files, problems = diffs.inspect(content)
-        parts.append("")
-        parts.append(diffs.summarize(files, problems))
-        if not history and not problems:
-            parts.append("")
-            parts.append(
-                "   Note this is CODE from someone you have never heard from. "
-                "Read it as code, not as a favour."
-            )
-
-    return ("\n".join(parts) + "\n\n") if parts else ""
-
-
 def do_check(_id, _args):
     if _needs_identity(_id, "receive messages"):
         return
@@ -1227,12 +1145,11 @@ def do_check(_id, _args):
             # scrolls (↑/↓ · PgUp/PgDn · Home/End · mouse, v2.1.76+), so long content
             # stays fully reviewable and Accept/Decline remain reachable at the bottom.
             content = fields["content"]
-            banner = _trust_banner(m.get("from_agent", "?"), content)
             prompt = (
                 "REVIEW, THEN DECIDE — scroll (↓ / PgDn) to read the whole message; "
                 "Accept / Decline are at the bottom.\n\n"
                 "INBOUND MESSAGE %d of %d — PENDING APPROVAL\n\n"
-                "From: %s\nTo:   %s\nAt:   %s\nSecurity: %s\n\n%s%s%s\n\n"
+                "From: %s\nTo:   %s\nAt:   %s\nSecurity: %s\n\n%s%s\n\n"
                 "— end of message —\n"
                 "Accept = add to Claude's context (downloads attachments to "
                 "quarantine).   Decline = discard."
@@ -1243,7 +1160,6 @@ def do_check(_id, _args):
                     addr,
                     m.get("timestamp", "?"),
                     security,
-                    banner,
                     content,
                     att_lines,
                 )
@@ -1251,10 +1167,6 @@ def do_check(_id, _args):
             action = elicit(prompt)
             if action == "accept":
                 approved.append(m)
-                # Familiarity is built from APPROVALS, not arrivals: anyone can
-                # send to you, so 'known' has to mean you decided to trust them.
-                record_sender(identity.split_agent_id(m.get("from_agent", ""))[1],
-                              m.get("from_agent"))
                 decided += 1
             elif action == "decline":
                 decided += 1
