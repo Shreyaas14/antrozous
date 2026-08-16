@@ -980,7 +980,24 @@ def open_envelope(m):
 
 def do_check(_id, _args):
     _publish_identities()
-    addresses = inbox_addresses()
+    requested = ((_args or {}).get("agent_id") or "").strip()
+    if requested:
+        # Only this device's own queues. The relay would refuse anything else
+        # anyway — it cannot be signed for — but say so plainly rather than
+        # surfacing a bare 401.
+        _, want = identity.split_agent_id(requested)
+        if not want or want != identity.split_agent_id(current_agent_id())[1]:
+            tool_result(
+                _id,
+                "%s is not a queue on this device, so it cannot be read from here. "
+                "Only queues ending in this device's key digest are readable."
+                % requested,
+                is_error=True,
+            )
+            return
+        addresses = [requested]
+    else:
+        addresses = inbox_addresses()
     fetched = []
     for addr in addresses:
         try:
@@ -1001,8 +1018,8 @@ def do_check(_id, _args):
     if stranded:
         note = (
             "\n\nOTHER QUEUES on this device are holding mail (not read, not "
-            "consumed — this session only polls its own):\n%s\nAsk to check one by "
-            "name to review it here."
+            "consumed — this session only polls its own):\n%s\nTo review one, call "
+            "check_inbox with agent_id set to it."
             % "\n".join("  - %s: %d pending" % (a, n) for a, n in stranded)
         )
     if not total:
@@ -1487,8 +1504,21 @@ TOOLS = [
         "description": "Check this session's inbox for pending messages and gate each through "
         "USER approval (shown out-of-band). You receive a message's content ONLY "
         "if the user approves it; declined messages never enter your context. Call "
-        "when the user asks to check their inbox/messages.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "when the user asks to check their inbox/messages. Pass agent_id only to "
+        "read one of THIS DEVICE's other queues, which check_inbox reports when "
+        "they hold mail — a queue left behind by renaming a session, or by a tab "
+        "that has since closed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "One of this device's other queues, as named in a "
+                    "previous check_inbox result. Defaults to this session's own.",
+                }
+            },
+            "required": [],
+        },
     },
     {
         "name": "whoami",
