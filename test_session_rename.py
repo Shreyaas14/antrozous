@@ -86,6 +86,26 @@ class SessionRenameTest(unittest.TestCase):
         self.assertEqual(self.saved(), "anish-bot.kbjz3w4a", "account must not move")
         self.assertEqual(self.gate.SESSION_AGENT_ID, "scratch.kbjz3w4a")
 
+    def test_set_identity_publishes_under_the_new_name(self):
+        """A rename has to claim the new alias, not wait for the next check_inbox.
+
+        Otherwise you tell someone "I'm agent-anish" and sends to that bare name
+        fail to resolve until you happen to poll your inbox.
+        """
+        self.reply("anish-bot-1", suggested="agent-shreyaas")
+        published = []
+        self.gate._publish_account_keys = lambda: published.append(
+            self.gate.account_agent_id()
+        )
+        # Renames require the user's approval in a popup; stand in for the tap.
+        self.gate.CLIENT_ELICITATION = True
+        self.gate._elicit = lambda prompt, schema: ("accept", {})
+        self.gate.tool_result = lambda *a, **kw: None
+        self.gate.do_set_identity(1, {"agent_id": "agent-anish.kbjz3w4a"})
+
+        self.assertEqual(self.saved(), "agent-anish.kbjz3w4a")
+        self.assertEqual(published, ["agent-anish.kbjz3w4a"])
+
     def test_whoami_flags_the_mismatch(self):
         self.reply("anish-bot", suggested="agent-shreyaas")
         self.identity.mark_confirmed(self.base)

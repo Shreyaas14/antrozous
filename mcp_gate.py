@@ -1356,6 +1356,11 @@ def do_set_identity(_id, args):
     if not env_pinned:
         _adopt_session_id(canonical)
 
+    # Publish under the NEW address immediately. Waiting for the next check_inbox
+    # leaves a window where you have already told people your new name but nothing
+    # has claimed the alias for it, so sends to the bare name fail to resolve.
+    _publish_account_keys()
+
     msg = "User APPROVED. Agent ID is now %s (saved to %s, %s scope)." % (
         canonical,
         target_path,
