@@ -17,6 +17,10 @@ AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}[a-z0-9]$")
 FINGERPRINT_RE = re.compile(r"^[a-z2-7]{8}$")
 
+# A session key becomes a filename, so it is restricted to characters that cannot
+# escape the sessions directory. Claude Code's session id is a UUID and fits.
+SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
 
 def normalize_name(candidate):
     """Canonical form of the human-chosen part of an id, or None if illegal."""
@@ -67,8 +71,22 @@ def sessions_dir():
     return os.path.join(global_dir(), "sessions")
 
 
-def _session_path(pid=None):
-    return os.path.join(sessions_dir(), "%d.json" % (pid or os.getpid()))
+def current_session_key():
+    """Filename stem for this session's record.
+
+    Keyed by the CLAUDE SESSION rather than the pid so that `claude --resume` in a
+    fresh terminal comes back as the same agent, polling the same queue. Falls back
+    to the pid outside Claude Code (tests, direct invocation), where there is no
+    session to be stable across.
+    """
+    raw = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if raw and SESSION_KEY_RE.match(raw) and ".." not in raw:
+        return raw
+    return "pid-%d" % os.getpid()
+
+
+def _session_path(key=None):
+    return os.path.join(sessions_dir(), "%s.json" % (key or current_session_key()))
 
 
 def _pid_alive(pid):
@@ -84,7 +102,12 @@ def _pid_alive(pid):
 
 
 def session_records():
-    """{pid: record} for sessions still running. Prunes dead entries."""
+    """{session_key: record} for EVERY record on disk.
+
+    Nothing is pruned. A record outlives its process on purpose — the session may
+    resume — and they are a few hundred bytes each, so accumulation is cheaper than
+    guessing when a session has been abandoned.
+    """
     out = {}
     try:
         names = os.listdir(sessions_dir())
@@ -94,25 +117,33 @@ def session_records():
         if not name.endswith(".json"):
             continue
         try:
-            pid = int(name[:-5])
-        except ValueError:
+            data = _read_json(os.path.join(sessions_dir(), name))
+        except (OSError, ValueError):
+            # _read_json only catches a missing file and bad JSON. A permission
+            # error, a directory in a record's place, or non-UTF-8 bytes would
+            # otherwise take the whole registry down over one bad file.
             continue
-        path = os.path.join(sessions_dir(), name)
-        if not _pid_alive(pid):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            continue
-        data = _read_json(path)
-        if data and data.get("agent_id"):
-            out[pid] = data
+        if isinstance(data, dict) and data.get("agent_id"):
+            out[name[:-5]] = data
     return out
 
 
+def live_session_records():
+    """{session_key: record} for records whose process is still running."""
+    return {
+        key: rec
+        for key, rec in session_records().items()
+        if isinstance(rec.get("pid"), int) and _pid_alive(rec["pid"])
+    }
+
+
 def live_sessions():
-    """{pid: agent_id} for sessions still running."""
-    return {pid: rec["agent_id"] for pid, rec in session_records().items()}
+    """{pid: agent_id} for sessions still running.
+
+    Signature deliberately unchanged: whoami, the startup prompt and the SessionStart
+    hook all render peers as (pid, agent_id) pairs.
+    """
+    return {rec["pid"]: rec["agent_id"] for rec in live_session_records().values()}
 
 
 def register_session(agent_id, primary=False):
@@ -120,9 +151,11 @@ def register_session(agent_id, primary=False):
     record = _read_json(_session_path()) or {}
     record.update(
         {
+            "claude_session_id": current_session_key(),
             "agent_id": agent_id,
             "pid": os.getpid(),
             "started_at": record.get("started_at") or str(datetime.now()),
+            "last_seen_at": str(datetime.now()),
         }
     )
     if primary:
@@ -132,18 +165,17 @@ def register_session(agent_id, primary=False):
 
 
 def primary_pid():
-    for pid, rec in session_records().items():
+    for rec in live_session_records().values():
         if rec.get("primary"):
-            return pid
+            return rec["pid"]
     return None
 
 
 def claim_primary(force=False):
-    """Take the primary slot if it is vacant (or force a handover). Returns True if
-    this process holds it afterwards.
+    """Take the primary slot if it is vacant or held by a dead session.
 
-    Claimed opportunistically rather than assigned once, so a closed primary does
-    not strand account mail — the next session to look takes over.
+    Claimed opportunistically rather than assigned once, so a closed primary does not
+    strand front-door mail — the next session to look takes over.
     """
     holder = primary_pid()
     if holder == os.getpid():
@@ -151,12 +183,13 @@ def claim_primary(force=False):
     if holder is not None and not force:
         return False
     if holder is not None:
-        other = _read_json(_session_path(holder)) or {}
-        other.pop("primary", None)
-        try:
-            _write_json(_session_path(holder), other)
-        except OSError:
-            return False
+        for key, rec in live_session_records().items():
+            if rec.get("primary"):
+                rec.pop("primary", None)
+                try:
+                    _write_json(_session_path(key), rec)
+                except OSError:
+                    return False
     record = _read_json(_session_path())
     if not (record and record.get("agent_id")):
         return False
@@ -170,8 +203,20 @@ def is_primary():
 
 
 def unregister_session():
+    """Mark this session not-live WITHOUT deleting its record.
+
+    The record has to survive so a resumed session finds its own address. Clearing
+    the pid rather than leaving it stale matters: pids are recycled by the OS, and a
+    stale one would eventually make a dead record look alive.
+    """
+    record = _read_json(_session_path())
+    if not record:
+        return
+    record["pid"] = None
+    record.pop("primary", None)
+    record["last_seen_at"] = str(datetime.now())
     try:
-        os.unlink(_session_path())
+        _write_json(_session_path(), record)
     except OSError:
         pass
 

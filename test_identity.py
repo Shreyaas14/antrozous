@@ -451,12 +451,13 @@ class SessionRegistryTests(IsolatedIdentityTest):
     def test_unregister_without_registering_is_a_noop(self):
         identity.unregister_session()
 
-    def test_dead_sessions_are_pruned(self):
-        # PID 1 is alive but not ours; a very high pid is almost certainly free.
+    def test_dead_sessions_are_excluded_but_not_deleted(self):
+        # A very high pid is almost certainly free. Records are never garbage
+        # collected — the record has to survive so a resumed session can find it.
         self._fake_session(999999, "agent-ghost")
 
         self.assertNotIn(999999, identity.live_sessions())
-        self.assertEqual(os.listdir(identity.sessions_dir()), [])
+        self.assertIn("999999.json", os.listdir(identity.sessions_dir()))
 
     def test_malformed_session_files_are_ignored(self):
         os.makedirs(identity.sessions_dir(), exist_ok=True)
@@ -503,6 +504,86 @@ class SessionRegistryTests(IsolatedIdentityTest):
 
     def test_sessions_live_under_the_overridable_home(self):
         self.assertTrue(identity.sessions_dir().startswith(self.home))
+
+
+class SessionKeyTests(IsolatedIdentityTest):
+    """Records are keyed by the Claude session so --resume reclaims its queue."""
+
+    def test_session_key_comes_from_the_claude_session_id(self):
+        with _env(CLAUDE_CODE_SESSION_ID="a133d3ce-293b-4c3a-9a83-5d5ec88a51ef"):
+            self.assertEqual(
+                identity.current_session_key(),
+                "a133d3ce-293b-4c3a-9a83-5d5ec88a51ef",
+            )
+
+    def test_session_key_falls_back_to_the_pid_outside_claude_code(self):
+        with _env(CLAUDE_CODE_SESSION_ID=None):
+            self.assertEqual(identity.current_session_key(), "pid-%d" % os.getpid())
+
+    def test_a_hostile_session_id_is_not_used_as_a_filename(self):
+        with _env(CLAUDE_CODE_SESSION_ID="../../etc/passwd"):
+            self.assertEqual(identity.current_session_key(), "pid-%d" % os.getpid())
+
+    def test_record_is_written_under_the_session_key(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            self.assertTrue(
+                os.path.exists(os.path.join(identity.sessions_dir(), "sess-one.json"))
+            )
+
+    def test_same_session_key_different_pid_reuses_the_record(self):
+        """This is what makes --resume keep its address."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            identity.unregister_session()
+            record = identity.session_records()["sess-one"]
+        self.assertEqual(record["agent_id"], "bob.aaaaaaaa")
+        self.assertIsNone(record["pid"])
+
+    def test_unregister_keeps_the_record_but_marks_it_not_live(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            identity.unregister_session()
+            self.assertIn("sess-one", identity.session_records())
+            self.assertNotIn("sess-one", identity.live_session_records())
+
+    def test_records_are_never_pruned(self):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "ghost.json"), "w") as f:
+            json.dump({"agent_id": "ghost.aaaaaaaa", "pid": 999999}, f)
+        self.assertIn("ghost", identity.session_records())
+        self.assertNotIn("ghost", identity.live_session_records())
+        self.assertTrue(
+            os.path.exists(os.path.join(identity.sessions_dir(), "ghost.json"))
+        )
+
+    def test_live_sessions_still_returns_pid_to_agent_id(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+        self.assertEqual(identity.live_sessions().get(os.getpid()), "bob.aaaaaaaa")
+
+    def test_one_unreadable_record_does_not_break_the_registry(self):
+        """Spec section 12. identity._read_json only catches a missing file and bad
+        JSON, so a permission error, a directory, or non-UTF-8 bytes would take the
+        whole registry down with it."""
+        if os.geteuid() == 0:
+            self.skipTest("running as root defeats permission-based tests")
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        good = os.path.join(identity.sessions_dir(), "good.json")
+        with open(good, "w") as f:
+            json.dump({"agent_id": "bob.aaaaaaaa", "pid": None}, f)
+        bad = os.path.join(identity.sessions_dir(), "bad.json")
+        with open(bad, "w") as f:
+            f.write("{}")
+        os.chmod(bad, 0o000)
+        self.addCleanup(os.chmod, bad, 0o600)
+        self.assertIn("good", identity.session_records())
+
+    def test_a_non_object_record_is_ignored(self):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "weird.json"), "w") as f:
+            f.write("[1, 2, 3]")
+        self.assertNotIn("weird", identity.session_records())
 
 
 class AccountAddressTests(IsolatedIdentityTest):
