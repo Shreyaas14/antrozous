@@ -684,6 +684,39 @@ class PrimarySessionTests(IsolatedIdentityTest):
 
         self.assertIsNone(identity.primary_pid())
 
+    def test_resuming_a_session_does_not_resurrect_a_stale_primary_flag(self):
+        """Regression: session records are now keyed by Claude session, not pid, so
+        a SIGKILLed primary's record survives forever (nothing is pruned) with
+        `primary: True` and a dead pid. A second session claims the now-vacant
+        slot. If the original session later resumes under the same session id but
+        a NEW pid, register_session() must not silently carry the stale `primary`
+        flag into the now-live record — that would produce two live primaries at
+        once, violating the single-holder invariant (spec section 6)."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-orig"):
+            os.makedirs(identity.sessions_dir(), exist_ok=True)
+            with open(
+                os.path.join(identity.sessions_dir(), "sess-orig.json"), "w"
+            ) as f:
+                json.dump(
+                    {"agent_id": "orig.27uumo4l", "pid": 999999, "primary": True}, f
+                )
+
+        with _env(CLAUDE_CODE_SESSION_ID="sess-other"):
+            identity.register_session("other.27uumo4l")
+            self.assertTrue(identity.claim_primary())
+
+        with _env(CLAUDE_CODE_SESSION_ID="sess-orig"):
+            # The original session resumes: same Claude session id, but a new pid
+            # (os.getpid() here is never 999999).
+            identity.register_session("orig.27uumo4l")
+
+        live_primaries = [
+            rec
+            for rec in identity.live_session_records().values()
+            if rec.get("primary")
+        ]
+        self.assertEqual(len(live_primaries), 1)
+
 
 class GitExclusionTests(unittest.TestCase):
     def test_project_identity_is_locally_git_ignored(self):

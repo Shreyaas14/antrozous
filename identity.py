@@ -149,6 +149,14 @@ def live_sessions():
 def register_session(agent_id, primary=False):
     os.makedirs(sessions_dir(), exist_ok=True)
     record = _read_json(_session_path()) or {}
+    # Only the SAME live process re-registering (a rename) may carry the primary
+    # flag forward untouched. Any other case sharing this session key — a resume
+    # under a new pid, or a record a crashed process left behind — must not
+    # resurrect a stale flag: claim_primary() decides afresh, next line, in the
+    # caller. Without this, a SIGKILLed primary's record (never pruned) can hand
+    # its flag to a resumed session while a second session already claimed the
+    # vacant slot, leaving two live primaries at once.
+    was_primary = bool(record.get("primary")) and record.get("pid") == os.getpid()
     record.update(
         {
             "claude_session_id": current_session_key(),
@@ -158,8 +166,10 @@ def register_session(agent_id, primary=False):
             "last_seen_at": str(datetime.now()),
         }
     )
-    if primary:
+    if primary or was_primary:
         record["primary"] = True
+    else:
+        record.pop("primary", None)
     _write_json(_session_path(), record)
     return agent_id
 
