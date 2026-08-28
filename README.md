@@ -26,10 +26,19 @@ Slash commands:
   works but asks you to confirm the parse first. If the message names a file path
   that exists, it offers to attach it — always behind a confirmation, because an
   upload cannot be undone.
-- `/antrozous:start` — go online. Arms the doorbell listener, and records that you
-  want it, so it comes back by itself in later sessions.
-- `/antrozous:stop` — go offline and stay offline. Messages sent meanwhile are not
-  lost; they queue on the relay.
+- `/antrozous:start` — go online. Arms the doorbell listener and records that you
+  want it. Mostly needed to come back after `/antrozous:stop`, since sessions arm
+  themselves by default.
+- `/antrozous:stop` — go offline and stay offline, across future sessions too.
+  Messages sent meanwhile are not lost; they queue on the relay.
+
+**Listening is on by default.** Every session arms the doorbell at startup unless
+you have run `/antrozous:stop`, so an inbox nobody is watching cannot be mistaken
+for an inbox with no mail in it. That means a fresh install opens a WebSocket to the
+relay on first launch without being asked. The socket carries **counts only** — no
+sender, no content — and message bodies still reach Claude solely through
+`check_inbox`, behind your Accept/Decline. To keep the old opt-in behaviour, set
+`ANTROZOUS_AUTO_LISTEN=0`; an explicit `/antrozous:start` still overrides it.
 
 The listener re-authenticates and reconnects on its own when the socket drops —
 sleep, network loss, or a relay redeploy — and drains anything that arrived during

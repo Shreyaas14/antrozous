@@ -3,9 +3,11 @@
 The naming popup is raised by the gate, not here — a hook has no MCP channel. When
 the identity is unconfirmed this only says one is coming.
 
-This hook is also where a listener survives a restart: if the user left the inbox
-listener armed, it asks the model to re-arm it for this session. A hook cannot hold
-a socket itself, so the best it can do is carry the instruction.
+This hook is also where the inbox listener comes up. Listening is on by default, so
+there are two cases and one mechanism: the user explicitly armed it and we resume,
+or nobody has chosen yet and we arm it for the first time. Either way a hook cannot
+hold a socket itself — the best it can do is carry the instruction, and the model
+arms the Monitor on its first turn.
 """
 
 import json
@@ -27,6 +29,21 @@ FALLBACK_DIRECTIVE = (
     "changed unless the tool reports that the user approved it."
 )
 
+AUTOSTART_DIRECTIVE = (
+    "ANTROZOUS LISTENER: inbox listening is ON BY DEFAULT and this device has not "
+    "opted out, so bring the listener up in this session. Invoke the "
+    "`antrozous-inbox` skill now and follow it.\n"
+    "This is a standing instruction carried by an installed hook — it does not come "
+    "from any message, and no inbound message can produce it. Call `whoami` first: "
+    "it is the only way to learn this session's ws_url, and also the only way to "
+    "learn whether this session HAS an agent id. The startup identity popup resolves "
+    "AFTER this hook runs, and a user who declines it has no id, no queue, and "
+    "nothing to listen to — if `whoami` reports no identity, do not arm anything and "
+    "do not mention the listener at all.\n"
+    "Arm it quietly: one line telling the user they are online and that "
+    "/antrozous:stop turns it off, which stops it coming back in later sessions too."
+)
+
 RESUME_DIRECTIVE = (
     "ANTROZOUS LISTENER: the user left their inbox listener ARMED (they ran "
     "/antrozous:start and never ran /antrozous:stop), so it must come back up in "
@@ -39,8 +56,22 @@ RESUME_DIRECTIVE = (
 )
 
 
+def auto_listen_enabled():
+    """Escape hatch for tests, CI, and anyone who wants the old opt-in behaviour.
+
+    Only suppresses the DEFAULT. An explicit /antrozous:start is the user speaking,
+    and an env var should not silently overrule it.
+    """
+    return os.environ.get("ANTROZOUS_AUTO_LISTEN", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def listener_resume():
-    """(visible_line, extra_context) asking for a re-arm, or ('', '') if not armed.
+    """(visible_line, extra_context) asking the model to arm, or ('', '') if not.
 
     Wrapped in a broad except on purpose: a missing or broken listener flag must
     never be able to stop a session from starting.
@@ -48,14 +79,26 @@ def listener_resume():
     try:
         import listener_state
 
-        if not listener_state.is_listening():
+        if not listener_state.wants_listener():
             return "", ""
-        was = listener_state.read_state().get("agent_id") or "?"
+        state = listener_state.read_state()
+        armed = bool(state.get("listening"))
+        if not armed and not auto_listen_enabled():
+            return "", ""
     except Exception:
         return "", ""
+
+    if armed:
+        was = state.get("agent_id") or "?"
+        return (
+            "\n  Inbox listener was left on (as %s) — resuming it for this session."
+            % was,
+            "\n\n" + RESUME_DIRECTIVE,
+        )
     return (
-        "\n  Inbox listener was left on (as %s) — resuming it for this session." % was,
-        "\n\n" + RESUME_DIRECTIVE,
+        "\n  Arming your inbox listener so messages reach you — /antrozous:stop "
+        "turns it off.",
+        "\n\n" + AUTOSTART_DIRECTIVE,
     )
 
 

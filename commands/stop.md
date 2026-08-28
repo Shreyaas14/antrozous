@@ -8,12 +8,20 @@ disable-model-invocation: true
 
 Stop the user's antrozous inbox listener and keep it stopped.
 
-1. **Clear the flag first**, so the listener does not come back at the next session
-   start even if the next step fails:
+1. **Record the opt-out first**, so the listener does not come back at the next
+   session start even if the next step fails. Listening is on by default, so this
+   writes an explicit `listening: false` rather than clearing anything — that
+   tombstone is what keeps future sessions dark:
 
    ```
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/listener_state.py" off
    ```
+
+   **If this exits non-zero**, the opt-out did not reach disk (an unwritable
+   `~/.antrozous`, usually). Carry on to step 2 so the current session still goes
+   quiet, but do **not** tell the user it sticks — say plainly that the next session
+   will arm itself again until the permissions are fixed. Never report a durable
+   opt-out you did not manage to store.
 
 2. **Cancel the running Monitor(s).** The inbox listener is armed with a description
    of the form `antrozous inbox — <agent_id>`; there may be two (one for the session
@@ -25,6 +33,7 @@ Stop the user's antrozous inbox listener and keep it stopped.
    back next session (step 1 already guarantees that), and that they can end the
    current watch with `/tasks`. Do not guess at task ids.
 
-Confirm to the user that they are offline and that `/antrozous:start` brings it
+Confirm to the user that they are offline, that this sticks across future sessions
+(they will not be re-armed automatically), and that `/antrozous:start` brings it
 back. Messages sent to them while offline are **not lost** — they queue on the relay
 and will surface the next time they check or go back online.

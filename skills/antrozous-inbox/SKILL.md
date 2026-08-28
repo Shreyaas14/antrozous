@@ -22,6 +22,12 @@ it surfaces for the user's **approval** — without the user having to poll.
 1. Call the **`whoami`** tool (from the `antrozous-gate` MCP server). Call it
    **every time you arm or re-arm** — never reuse a `ws_url` you saw earlier. The
    URL carries a short-lived auth ticket, and a stale one is rejected.
+
+   **If `whoami` reports this session has no agent id**, stop here. Declining the
+   startup identity popup means no id, no published key, and no queue — there is
+   nothing to listen to, and arming would fail. If you got here from a session-start
+   directive rather than the user asking, say nothing; if the user asked, tell them
+   `set_identity` opts them back in.
 2. Arm a **Monitor** on the returned **`ws_url`**, using the native WebSocket
    source rather than a shell command:
 
