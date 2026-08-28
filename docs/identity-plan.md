@@ -474,6 +474,18 @@ class OrdinalCounterTests(IsolatedIdentityTest):
         identity.set_agent_id(self.home, "renamed.e5ox72jb")
         self.assertEqual(identity.next_ordinal(), 3)
 
+    def test_account_name_survives_a_rename(self):
+        """_write_identity rebuilds the record from scratch; these keys must be
+        carried forward with the fingerprint or a rename resets the ordinals."""
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["account_name"] = "anish-bot"
+        identity._write_json(path, record)
+        identity.set_agent_id(self.home, "renamed.e5ox72jb")
+        self.assertEqual(
+            identity._read_json(path).get("account_name"), "anish-bot"
+        )
+
     def test_seeding_lifts_the_counter_above_existing_ordinals(self):
         os.makedirs(identity.sessions_dir(), exist_ok=True)
         for n, name in enumerate(["anish-bot-2", "anish-bot-7", "anish-bot-3"]):
@@ -551,6 +563,24 @@ def seed_counter_from_records():
             _write_json(path, record)
     return high
 ```
+
+Then teach `_write_identity` (line 320) to carry the new keys forward. It rebuilds
+the record from scratch and copies only `fingerprint`, `created_at`, `renamed_at`
+and `previous_agent_id`, so without this a rename silently resets the ordinal
+counter and the next session reuses a number that already has a queue:
+
+```python
+    existing = previous if previous is not None else _read_json(path)
+    if existing:
+        # Carried forward for the same reason as the fingerprint: these describe the
+        # DEVICE, not the name, and a rename must not reset them. Dropping
+        # session_counter would hand out an ordinal that already has a queue.
+        for key in ("fingerprint", "account_name", "session_counter"):
+            if existing.get(key) is not None:
+                record[key] = existing[key]
+```
+
+replacing the existing two-line `if existing and existing.get("fingerprint"):` block.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -934,7 +964,29 @@ class HookAnnouncementTests(ListenerStateTest):
     def test_unknown_session_does_not_invent_an_ordinal(self):
         payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
         self.assertNotIn("-1.", payload["systemMessage"])
+
+    def test_a_later_run_does_not_announce_a_popup(self):
+        """Task 4 deleted the per-session popup. The hook must stop promising it."""
+        identity_json = os.path.join(self.home, "identity.json")
+        with open(identity_json, "w") as f:
+            json.dump(
+                {
+                    "agent_id": "anish-bot.e5ox72jb",
+                    "account_name": "anish-bot",
+                    "fingerprint": "e5ox72jb",
+                    "confirmed": True,
+                },
+                f,
+            )
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertNotIn("prompt will appear", payload["systemMessage"])
+
+    def test_a_first_run_still_announces_the_popup(self):
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertIn("prompt will appear", payload["systemMessage"])
 ```
+
+`import identity` at the top of `test_listener_state.py` if it is not already there.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -970,8 +1022,40 @@ def session_line():
     return ""
 ```
 
-Then in the non-env branch of `__main__`, append `session_line()` to `line` before
-`emit(...)`, alongside `resume_line`.
+Also add, next to it:
+
+```python
+def will_prompt():
+    """Whether the gate is about to raise the account-naming popup.
+
+    It only fires on a first run now, so announcing one on every launch would
+    promise a popup that never arrives.
+    """
+    try:
+        return not identity.account_name()
+    except Exception:
+        return False
+```
+
+Then in the non-env branch of `__main__`, branch the announcement instead of always
+promising a prompt:
+
+```python
+    if will_prompt():
+        line = (
+            "antrozous: choosing your Agent ID — a prompt will appear %s "
+            "(suggested: %s). No need to type anything; just wait for it."
+            % (human_delay(startup_delay()), suggested)
+        )
+    else:
+        line = "antrozous: ready"
+    if peers:
+        line += "\n  Already running: %s" % ", ".join(sorted(peers.values()))
+    emit(line + session_line() + resume_line, (FALLBACK_DIRECTIVE % agent_id) + resume_context)
+```
+
+`session_line()` supplies the identity on the non-prompting path, so "ready" is
+never the whole message.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
