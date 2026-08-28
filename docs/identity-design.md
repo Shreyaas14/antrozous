@@ -286,21 +286,23 @@ The listener work established the pattern: subprocess the hook and the CLI, redi
   `listener.json` now has — unreadable, non-UTF-8, directory-in-place, non-object
   JSON must all degrade rather than raise.
 
-## 13. Open verification — blocking
+## 13. Verified — resume keeps the session id
 
-**Is `CLAUDE_CODE_SESSION_ID` stable across `claude --resume`?**
+**Confirmed 2026-08-28.** Two headless runs against a temp `ANTROZOUS_HOME`, with a
+probe writing `CLAUDE_CODE_SESSION_ID` from inside `mcp_gate.main()`:
 
-The whole of §4 rests on it. If resuming mints a new id linked to the old
-transcript, session-keyed identity degrades to exactly today's behaviour and §4
-should not be built.
+```
+pid=44284 session=0837931f-fb4a-4b24-8f9e-ff5942b7a6e7   # claude --plugin-dir . -p
+pid=44470 session=0837931f-fb4a-4b24-8f9e-ff5942b7a6e7   # claude --plugin-dir . --resume <id> -p
+```
 
-Check: note the value in a session, `claude --resume` it in a fresh terminal, and
-compare. A second, cheaper check: confirm a running `mcp_gate.py` actually inherits
-the variable — it could not be verified during this design because no gate process
-was running.
+Different process, same session id. Both halves hold: the MCP server inherits the
+variable (it is not in `.mcp.json`; the environment passes through), and `--resume`
+preserves it. Section 4 is safe to build.
 
-If the id is not stable, the fallback is to key on it anyway and accept that resume
-starts a new session — no worse than today, and the rest of the design stands.
+Note for anyone repeating this: the resume run needs `--plugin-dir` too. Without it
+no plugin loads, no gate starts, and the probe stays silent — which reads exactly
+like a failed check.
 
 ## 14. Out of scope
 
