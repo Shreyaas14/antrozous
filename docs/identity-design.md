@@ -220,13 +220,15 @@ nothing worth renaming.
 {
   "claude_session_id": "a133d3ce-293b-4c3a-9a83-5d5ec88a51ef",
   "agent_id": "anish-bot-3.e5ox72jb",
-  "ordinal": 3,
   "pid": 39867,
   "started_at": "...",
   "last_seen_at": "...",
   "primary": true
 }
 ```
+
+The ordinal is not stored separately — it is already the tail of `agent_id`, and a
+second copy could disagree with the first.
 
 `last_seen_at` is refreshed on each session start so a human reading the directory
 can tell a long-dormant session from a recent one, even though nothing prunes.
