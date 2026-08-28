@@ -777,5 +777,73 @@ class GitExclusionTests(unittest.TestCase):
             self.assertEqual(status.stdout, "")
 
 
+class AccountNameTests(IsolatedIdentityTest):
+    def test_account_name_falls_back_to_the_saved_agent_id(self):
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_explicit_account_name_wins(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["account_name"] = "anish-bot"
+        identity._write_json(path, record)
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_account_name_is_none_when_nothing_is_saved(self):
+        self.assertIsNone(identity.account_name())
+
+
+class OrdinalCounterTests(IsolatedIdentityTest):
+    def setUp(self):
+        super().setUp()
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def test_counter_starts_at_one(self):
+        self.assertEqual(identity.next_ordinal(), 1)
+
+    def test_counter_increments_and_never_repeats(self):
+        seen = [identity.next_ordinal() for _ in range(5)]
+        self.assertEqual(seen, [1, 2, 3, 4, 5])
+        self.assertEqual(len(set(seen)), 5)
+
+    def test_counter_persists_across_reads(self):
+        identity.next_ordinal()
+        identity.next_ordinal()
+        self.assertEqual(
+            identity._read_json(identity._global_path())["session_counter"], 2
+        )
+
+    def test_counter_survives_a_rename(self):
+        identity.next_ordinal()
+        identity.next_ordinal()
+        identity.set_agent_id(self.home, "renamed.e5ox72jb")
+        self.assertEqual(identity.next_ordinal(), 3)
+
+    def test_account_name_survives_a_rename(self):
+        """_write_identity rebuilds the record from scratch; these keys must be
+        carried forward with the fingerprint or a rename resets the ordinals."""
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["account_name"] = "anish-bot"
+        identity._write_json(path, record)
+        identity.set_agent_id(self.home, "renamed.e5ox72jb")
+        self.assertEqual(
+            identity._read_json(path).get("account_name"), "anish-bot"
+        )
+
+    def test_seeding_lifts_the_counter_above_existing_ordinals(self):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        for n, name in enumerate(["anish-bot-2", "anish-bot-7", "anish-bot-3"]):
+            with open(os.path.join(identity.sessions_dir(), "s%d.json" % n), "w") as f:
+                json.dump({"agent_id": "%s.e5ox72jb" % name, "pid": None}, f)
+        self.assertEqual(identity.seed_counter_from_records(), 7)
+        self.assertEqual(identity.next_ordinal(), 8)
+
+    def test_seeding_with_no_records_leaves_the_counter_alone(self):
+        self.assertEqual(identity.seed_counter_from_records(), 0)
+        self.assertEqual(identity.next_ordinal(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

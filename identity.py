@@ -274,6 +274,61 @@ def saved_fingerprint():
     return (_read_json(_global_path()) or {}).get("fingerprint")
 
 
+ORDINAL_SUFFIX_RE = re.compile(r"^(?P<stem>.+)-(?P<ordinal>\d+)$")
+
+
+def account_name():
+    """The stem every session id is built from, or None on a fresh install.
+
+    Stored explicitly so a saved id that already ends in a number (`anish-bot-1`)
+    can be separated from the ordinal machinery rather than fighting it.
+    """
+    record = _read_json(_global_path()) or {}
+    explicit = normalize_name(record.get("account_name") or "")
+    if explicit:
+        return explicit
+    saved = record.get("agent_id")
+    return normalize_name(agent_name(saved)) if saved else None
+
+
+def next_ordinal():
+    """Take the next session ordinal. Monotonic; never reuses a number.
+
+    Reuse is the bug this replaces: picking the lowest ordinal not held by a LIVE
+    session let a new session inherit a closed one's queue, which is the very
+    cross-session drain inbox_addresses() refuses to perform.
+    """
+    path = _global_path()
+    os.makedirs(global_dir(), exist_ok=True)
+    record = _read_json(path) or {}
+    current = record.get("session_counter")
+    nxt = (current if isinstance(current, int) and current >= 0 else 0) + 1
+    record["session_counter"] = nxt
+    _write_json(path, record)
+    return nxt
+
+
+def seed_counter_from_records():
+    """Lift the counter above every ordinal already used. Returns the high-water mark.
+
+    Run once at migration: a queue already exists on the relay for those names, and
+    handing the same ordinal out again would silently adopt it.
+    """
+    high = 0
+    for rec in session_records().values():
+        match = ORDINAL_SUFFIX_RE.match(agent_name(rec.get("agent_id") or ""))
+        if match:
+            high = max(high, int(match.group("ordinal")))
+    if high:
+        path = _global_path()
+        os.makedirs(global_dir(), exist_ok=True)
+        record = _read_json(path) or {}
+        if (record.get("session_counter") or 0) < high:
+            record["session_counter"] = high
+            _write_json(path, record)
+    return high
+
+
 def save_fingerprint(fp):
     """Cache the gate's key fingerprint so crypto-free callers can build full ids."""
     if not (isinstance(fp, str) and FINGERPRINT_RE.match(fp)):
@@ -377,8 +432,13 @@ def _write_identity(path, agent_id, previous=None, confirmed=True):
     # The fingerprint is cached here for crypto-free readers; a rename must not drop
     # it or the hook loses the ability to build qualified ids.
     existing = previous if previous is not None else _read_json(path)
-    if existing and existing.get("fingerprint"):
-        record["fingerprint"] = existing["fingerprint"]
+    if existing:
+        # Carried forward for the same reason as the fingerprint: these describe the
+        # DEVICE, not the name, and a rename must not reset them. Dropping
+        # session_counter would hand out an ordinal that already has a queue.
+        for key in ("fingerprint", "account_name", "session_counter"):
+            if existing.get(key) is not None:
+                record[key] = existing[key]
     if previous and previous.get("created_at"):
         record["created_at"] = previous["created_at"]
         record["renamed_at"] = str(datetime.now())
