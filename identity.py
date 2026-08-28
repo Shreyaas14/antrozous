@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 import json
@@ -5,6 +6,11 @@ import secrets
 import subprocess
 
 from datetime import datetime
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; the counter degrades to unlocked.
+    fcntl = None
 
 GIT_EXCLUDE_PATTERN = ".antrozous/"
 
@@ -291,28 +297,84 @@ def account_name():
     return normalize_name(agent_name(saved)) if saved else None
 
 
+def _counter_lock_path():
+    return os.path.join(global_dir(), ".counter.lock")
+
+
+@contextlib.contextmanager
+def _counter_lock():
+    """Best-effort cross-process mutex around the counter's read-modify-write.
+
+    A dedicated lock file, separate from identity.json and never replaced: flock
+    is scoped to the file's inode, and _write_json replaces identity.json's inode
+    on every write via os.replace, so a lock taken on that path directly would end
+    up guarding an orphaned file. This file is only ever opened and flock'd, never
+    swapped out, so the lock stays meaningful across writers.
+
+    flock is released by the kernel the instant the holding process exits or is
+    killed, so unlike an O_CREAT|O_EXCL marker (identity.py's own primary-session
+    flag, keys.py's key file) this has no stale-lock failure mode — a process
+    SIGKILLed mid-increment cannot wedge the next session.
+
+    Best-effort: if fcntl is unavailable (Windows) or flock raises OSError (some
+    network filesystems), proceed WITHOUT the lock rather than failing the caller.
+    A missing lock must never stop a session from starting; on such a platform the
+    race simply remains, which is exactly today's behavior, so nothing regresses.
+    """
+    if fcntl is None:
+        yield
+        return
+    os.makedirs(global_dir(), exist_ok=True)
+    try:
+        fd = os.open(_counter_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+
+
 def next_ordinal():
     """Take the next session ordinal. Monotonic; never reuses a number.
 
     Reuse is the bug this replaces: picking the lowest ordinal not held by a LIVE
     session let a new session inherit a closed one's queue, which is the very
-    cross-session drain inbox_addresses() refuses to perform.
+    cross-session drain inbox_addresses() refuses to perform. Guarded by
+    _counter_lock() so two sessions started at nearly the same instant cannot both
+    read the same starting value and hand out the same ordinal; on a platform where
+    that lock is unavailable this degrades to the same race as before.
     """
     path = _global_path()
     os.makedirs(global_dir(), exist_ok=True)
-    record = _read_json(path) or {}
-    current = record.get("session_counter")
-    nxt = (current if isinstance(current, int) and current >= 0 else 0) + 1
-    record["session_counter"] = nxt
-    _write_json(path, record)
-    return nxt
+    with _counter_lock():
+        record = _read_json(path) or {}
+        current = record.get("session_counter")
+        nxt = (current if isinstance(current, int) and current >= 0 else 0) + 1
+        record["session_counter"] = nxt
+        _write_json(path, record)
+        return nxt
 
 
 def seed_counter_from_records():
     """Lift the counter above every ordinal already used. Returns the high-water mark.
 
     Run once at migration: a queue already exists on the relay for those names, and
-    handing the same ordinal out again would silently adopt it.
+    handing the same ordinal out again would silently adopt it. Shares
+    _counter_lock() with next_ordinal() so a concurrent seed and increment cannot
+    interleave into a lost update.
     """
     high = 0
     for rec in session_records().values():
@@ -322,10 +384,11 @@ def seed_counter_from_records():
     if high:
         path = _global_path()
         os.makedirs(global_dir(), exist_ok=True)
-        record = _read_json(path) or {}
-        if (record.get("session_counter") or 0) < high:
-            record["session_counter"] = high
-            _write_json(path, record)
+        with _counter_lock():
+            record = _read_json(path) or {}
+            if (record.get("session_counter") or 0) < high:
+                record["session_counter"] = high
+                _write_json(path, record)
     return high
 
 
@@ -433,9 +496,11 @@ def _write_identity(path, agent_id, previous=None, confirmed=True):
     # it or the hook loses the ability to build qualified ids.
     existing = previous if previous is not None else _read_json(path)
     if existing:
-        # Carried forward for the same reason as the fingerprint: these describe the
-        # DEVICE, not the name, and a rename must not reset them. Dropping
-        # session_counter would hand out an ordinal that already has a queue.
+        # A rename only replaces agent_id; none of these should reset with it.
+        # fingerprint identifies the device. session_counter is the device's
+        # ordinal high-water mark — dropping it would hand out a number that
+        # already has a queue. account_name is the user's chosen stem, set once
+        # and independent of whatever id a particular session ends up with.
         for key in ("fingerprint", "account_name", "session_counter"):
             if existing.get(key) is not None:
                 record[key] = existing[key]

@@ -2,6 +2,7 @@ import contextlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -843,6 +844,47 @@ class OrdinalCounterTests(IsolatedIdentityTest):
     def test_seeding_with_no_records_leaves_the_counter_alone(self):
         self.assertEqual(identity.seed_counter_from_records(), 0)
         self.assertEqual(identity.next_ordinal(), 1)
+
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+class OrdinalConcurrencyTests(IsolatedIdentityTest):
+    """next_ordinal() must be safe against real concurrent processes.
+
+    Threads in one process share the GIL around any single bytecode op but not
+    across a read-a-file / compute / write-a-file sequence, and more to the point
+    would not exercise cross-process file locking at all. Only separate OS
+    processes hitting the same ANTROZOUS_HOME are a faithful test of the race:
+    two sessions launched close together must never be handed the same ordinal,
+    or they end up with the same agent id and drain each other's relay queue.
+    """
+
+    def setUp(self):
+        super().setUp()
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def test_concurrent_processes_never_get_the_same_ordinal(self):
+        n = 20
+        code = "import identity; print(identity.next_ordinal())"
+        env = os.environ.copy()
+        env["ANTROZOUS_HOME"] = self.home
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(n)
+        ]
+        results = [int(p.communicate()[0].strip()) for p in procs]
+        self.assertEqual(
+            sorted(results),
+            list(range(1, n + 1)),
+            "ordinals were not distinct/consecutive: %r" % (results,),
+        )
 
 
 if __name__ == "__main__":
