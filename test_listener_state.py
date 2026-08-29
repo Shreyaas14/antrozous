@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
+import bootstrap_identity
 import identity
 import listener_state
 
@@ -533,6 +534,66 @@ class HookAnnouncementTests(ListenerStateTest):
     def test_a_first_run_still_announces_the_popup(self):
         payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
         self.assertIn("prompt will appear", payload["systemMessage"])
+
+
+class SessionLineDirectTests(ListenerStateTest):
+    """session_line() called directly, bypassing the hook's own __main__.
+
+    identity.describe() -- pre-existing, unmodified, and unguarded -- reads both
+    the project and global identity files unconditionally as the very first
+    statement of the hook's __main__. Any corruption severe enough to make
+    account_agent_id() raise ALSO makes describe() raise, which crashes the whole
+    hook subprocess before session_line() is ever reached (verified: the same
+    scenario below, run through the actual hook subprocess, still exits 1 with a
+    traceback out of identity.describe(), unaffected by session_line()'s own
+    fix). That is a separate, broader, pre-existing gap outside this task's
+    scope. What CAN be isolated and proven here is session_line()'s own
+    contract: called directly, it must not raise even when the account_agent_id()
+    call it makes internally does.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if os.geteuid() == 0:
+            self.skipTest("running as root defeats permission-based tests")
+
+    def test_survives_an_unreadable_project_identity_file(self):
+        os.makedirs(os.path.join(self.home, "sessions"), exist_ok=True)
+        with open(os.path.join(self.home, "sessions", "sess-a.json"), "w") as f:
+            json.dump({"agent_id": "anish-bot-3.e5ox72jb", "pid": None}, f)
+        with open(os.path.join(self.home, "identity.json"), "w") as f:
+            json.dump({"account_name": "anish-bot"}, f)
+
+        project_dir = os.path.join(self._tmp.name, "project")
+        os.makedirs(os.path.join(project_dir, ".antrozous"))
+        project_identity = os.path.join(project_dir, ".antrozous", "identity.json")
+        with open(project_identity, "w") as f:
+            json.dump({"not_agent_id": "irrelevant"}, f)
+        os.chmod(project_identity, 0o000)
+        self.addCleanup(os.chmod, project_identity, 0o600)
+
+        saved = {
+            k: os.environ.get(k)
+            for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR", "AGENT_ID")
+        }
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(restore)
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-a"
+        os.environ["CLAUDE_PROJECT_DIR"] = project_dir
+        os.environ.pop("AGENT_ID", None)
+
+        try:
+            line = bootstrap_identity.session_line()  # must not raise
+        except Exception as e:
+            self.fail("session_line() raised %r instead of degrading" % (e,))
+        self.assertIsInstance(line, str)
 
 
 if __name__ == "__main__":

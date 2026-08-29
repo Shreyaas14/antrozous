@@ -139,18 +139,18 @@ def session_line():
     try:
         record = identity.session_records().get(identity.current_session_key())
         account = identity.account_name()
+        if record and record.get("agent_id"):
+            line = "\n  You are %s" % record["agent_id"]
+            if account:
+                line += " (front door: %s)" % identity.account_agent_id(
+                    identity.find_directory()
+                )
+            return line
+        if account:
+            return "\n  Assigning this session's id from %s." % account
+        return ""
     except Exception:
         return ""
-    if record and record.get("agent_id"):
-        line = "\n  You are %s" % record["agent_id"]
-        if account:
-            line += " (front door: %s)" % identity.account_agent_id(
-                identity.find_directory()
-            )
-        return line
-    if account:
-        return "\n  Assigning this session's id from %s." % account
-    return ""
 
 
 def will_prompt(info):
