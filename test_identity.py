@@ -427,7 +427,7 @@ class FingerprintCacheTests(IsolatedIdentityTest):
 
 
 class SessionRegistryTests(IsolatedIdentityTest):
-    """Per-session ids: each tab registers so the next one is offered a free name."""
+    """register_session()/unregister_session() and live_sessions() bookkeeping."""
 
     def _fake_session(self, pid, agent_id):
         os.makedirs(identity.sessions_dir(), exist_ok=True)
