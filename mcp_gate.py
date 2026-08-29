@@ -1393,15 +1393,23 @@ def whoami_payload():
 
 
 def _identity_prompt(info, suggested, scope, drop_override):
-    """(prompt, schema) for the identity popup, shared by startup and set_identity."""
+    """(prompt, schema) for set_identity's confirmation popup.
+
+    (The startup popup that fires on a first run is a different function,
+    _session_prompt -- this one only ever runs from do_set_identity.)
+    """
     target_path = info["global_path"] if scope == "global" else info["project_path"]
 
-    notes = (
-        "\n\nRenaming changes the name new contacts see and the stem your sessions "
-        "are numbered from. It does NOT move the alias you already claimed: the "
-        "relay binds an alias to your KEY, first claim wins, so people who "
-        "already have your old name still reach you."
-    )
+    notes = ""
+    if not info["needs_setup"]:
+        # Only true of an actual RENAME -- a first run has no alias already
+        # claimed under any name, so the notice would be meaningless there.
+        notes += (
+            "\n\nRenaming changes the name new contacts see and the stem your "
+            "sessions are numbered from. It does NOT move the alias you already "
+            "claimed: the relay binds an alias to your KEY, first claim wins, so "
+            "people who already have your old name still reach you."
+        )
     if info["source"] == "env":
         notes += (
             "\n\nNOTE: $AGENT_ID=%s is set and takes precedence. Saving here updates "
@@ -1443,9 +1451,10 @@ def _identity_prompt(info, suggested, scope, drop_override):
             "Proposed: %s\n\n"
             "%s\nSaved to: %s\n\n"
             "This is the account address other agents send to directly. After the "
-            "change, mail addressed to the exact old address %s lands in a queue "
-            "nothing drains automatically -- see the note below on what still "
-            "reaches you and what does not.\n\n"
+            "change, mail addressed to the exact old address %s is delivered to "
+            "whichever session already answers to that address -- this one, if it "
+            "does; otherwise it sits in an orphaned queue that nothing drains "
+            "automatically until you go looking for it.\n\n"
             "Allowed: 2-64 chars of a-z, 0-9, dot, dash, underscore; start and end "
             "alphanumeric.%s\n\n"
             "Accept = save it.   Decline = keep %s."
@@ -1570,10 +1579,33 @@ def do_set_identity(_id, args):
     # call) would move this session's queue onto the account address; if some
     # OTHER live session holds the primary slot, both would then drain the same
     # physical queue, which breaks the private-room guarantee inbox_addresses()
-    # relies on. set_account_name() takes the identity lock that also guards
+    # relies on.
+    #
+    # Only for scope=="global": a project-scoped identity is a standalone
+    # address for one directory, same as set_agent_id's own project branch
+    # writes only the project file. account_name is the device-wide stem every
+    # OTHER directory's sessions derive their ids from -- a project rename
+    # must not touch it, or one directory's project-scoped choice silently
+    # renames every session on the machine.
+    #
+    # set_account_name() takes the identity lock that also guards
     # session_counter, so the gate writes through it rather than touching the
-    # global record itself.
-    identity.set_account_name(identity.agent_name(canonical))
+    # global record itself. Wrapped like set_agent_id() just above: `canonical`
+    # is already written to disk at this point, so an OSError here (a full
+    # disk, say) must not be allowed to propagate out of tools/call dispatch
+    # and take the whole gate down.
+    if scope == "global":
+        try:
+            identity.set_account_name(identity.agent_name(canonical))
+        except (ValueError, OSError) as e:
+            tool_result(
+                _id,
+                "Agent id saved as %s, but the account name could not be updated "
+                "(%s). Session ids may still be derived from the previous name "
+                "until set_identity is run again." % (canonical, e),
+                is_error=True,
+            )
+            return
 
     # Pin this session back onto its pre-rename address. Leaving SESSION_AGENT_ID
     # untouched is not enough on its own: a session that has never explicitly

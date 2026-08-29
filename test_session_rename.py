@@ -457,7 +457,7 @@ class SetIdentityAccountTests(SessionRenameFixture):
     nothing worth renaming, and renaming it out from under a primary session
     would break the private-room guarantee (see mcp_gate.inbox_addresses)."""
 
-    def rename_to(self, name):
+    def rename_to(self, name, scope="global"):
         real = self.gate._elicit
         self.addCleanup(
             setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
@@ -468,7 +468,9 @@ class SetIdentityAccountTests(SessionRenameFixture):
             {"agent_id": "%s.kbjz3w4a" % name},
         )
         try:
-            self.gate.do_set_identity("rid-1", {"agent_id": "%s.kbjz3w4a" % name})
+            self.gate.do_set_identity(
+                "rid-1", {"agent_id": "%s.kbjz3w4a" % name, "scope": scope}
+            )
         finally:
             self.gate._elicit = real
 
@@ -481,12 +483,107 @@ class SetIdentityAccountTests(SessionRenameFixture):
         before = self.gate.current_agent_id()
         self.rename_to("newname")
         self.assertEqual(self.gate.current_agent_id(), before)
+        # Stronger than the line above: this also fails a "session got pinned
+        # to the stale ACCOUNT address" implementation that happens to equal
+        # `before` by coincidence of this fixture's fresh setup -- the id must
+        # not just be unchanged, it must not have become the (new) account
+        # address either.
+        self.assertNotEqual(self.gate.current_agent_id(), self.gate.account_agent_id())
+
+    def test_project_scope_rename_does_not_touch_the_global_account_name(self):
+        """set_account_name always writes _global_path(). A project-scoped
+        rename must not call it at all: account_name is the device-wide stem
+        every OTHER directory's sessions derive their ids from, and a project
+        directory renaming its own separate identity has no business moving
+        it out from under every other directory on the machine.
+        """
+        identity.set_agent_id(self.base, "globalacct.kbjz3w4a")
+        identity.set_account_name("globalacct")
+
+        self.rename_to("projname", scope="project")
+
+        record = identity._read_json(identity._global_path())
+        self.assertEqual(record["agent_id"], "globalacct.kbjz3w4a")
+        self.assertEqual(record["account_name"], "globalacct")
+        # The project file itself DID get the new id -- this isn't a no-op,
+        # just correctly scoped.
+        self.assertEqual(
+            identity.describe(self.base)["agent_id"], "projname.kbjz3w4a"
+        )
+
+    def test_account_name_write_failure_is_reported_not_raised(self):
+        """set_account_name is the only unguarded write in do_set_identity --
+        its neighbour set_agent_id is wrapped in except OSError. Unwrapped, an
+        OSError here (e.g. a full disk) would propagate out of tools/call
+        dispatch and take the whole gate down, AFTER agent_id was already
+        written to disk.
+        """
+        self.addCleanup(
+            setattr, self.identity, "set_account_name", self.identity.set_account_name
+        )
+        self.identity.set_account_name = lambda name: (_ for _ in ()).throw(
+            OSError("disk full")
+        )
+        results = []
+        self.addCleanup(setattr, self.gate, "tool_result", self.gate.tool_result)
+        self.gate.tool_result = lambda _id, text, **kw: results.append(
+            (text, kw.get("is_error", False))
+        )
+
+        self.rename_to("newname")  # must not raise
+
+        self.assertTrue(results, "do_set_identity must still report something")
+        self.assertTrue(results[-1][1], "must be reported as an error")
+        self.assertEqual(
+            identity._read_json(identity._global_path())["agent_id"],
+            "newname.kbjz3w4a",
+            "agent_id had already landed on disk before the failing write",
+        )
 
     def test_prompt_says_the_alias_does_not_move(self):
+        """Exercises the RENAME branch specifically (an already-set-up
+        account), not the first-run branch -- there is no alias "already
+        claimed" to talk about on a first run, and this task rewrote the
+        rename branch's copy, not the first-run branch's.
+        """
+        identity.set_agent_id(self.base, "oldname.kbjz3w4a")
+        prompt, _ = self.gate._identity_prompt(
+            identity.describe(self.base), "newname", "global", False
+        )
+        self.assertIn("CHANGE YOUR ANTROZOUS AGENT ID?", prompt)
+        self.assertIn(
+            "does NOT move the alias you already claimed",
+            prompt,
+            "must be the specific rename notice, not just the word 'alias' "
+            "appearing anywhere",
+        )
+
+    def test_first_run_prompt_says_nothing_about_an_alias(self):
+        """The alias-does-not-move notice is only true of an actual rename --
+        a first run has no alias already claimed under any name yet."""
         prompt, _ = self.gate._identity_prompt(
             identity.describe(self.home), "newname", "global", False
         )
-        self.assertIn("alias", prompt.lower())
+        self.assertIn("NAME YOUR ANTROZOUS AGENT", prompt)
+        self.assertNotIn("alias", prompt.lower())
+
+    def test_prompt_does_not_claim_the_old_address_is_always_orphaned(self):
+        """Regression: a prior rewording of this prompt asserted the old
+        address "lands in a queue nothing drains automatically" as a flat
+        fact. False whenever the renaming session never adopted an id of its
+        own: do_set_identity pins that session back onto exactly the address
+        being renamed away from (see test_rename_does_not_change_this_session_id),
+        so THAT session goes right on draining it -- directly contradicting
+        the approval message printed seconds later ("this session itself
+        keeps sending and receiving as %s"). The copy now names both possible
+        outcomes instead of asserting the one that doesn't always hold.
+        """
+        identity.set_agent_id(self.base, "oldname.kbjz3w4a")
+        prompt, _ = self.gate._identity_prompt(
+            identity.describe(self.base), "newname", "global", False
+        )
+        self.assertNotIn("lands in a queue nothing drains automatically", prompt)
+        self.assertIn("whichever session already answers to that address", prompt)
 
 
 if __name__ == "__main__":
