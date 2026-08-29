@@ -1442,8 +1442,10 @@ def _identity_prompt(info, suggested, scope, drop_override):
             "Current:  %s   (%s)\n"
             "Proposed: %s\n\n"
             "%s\nSaved to: %s\n\n"
-            "This is the id other agents send to. After the change, messages addressed "
-            "to %s will NOT arrive — tell anyone who messages you about the new one.\n\n"
+            "This is the account address other agents send to directly. After the "
+            "change, mail addressed to the exact old address %s lands in a queue "
+            "nothing drains automatically -- see the note below on what still "
+            "reaches you and what does not.\n\n"
             "Allowed: 2-64 chars of a-z, 0-9, dot, dash, underscore; start and end "
             "alphanumeric.%s\n\n"
             "Accept = save it.   Decline = keep %s."
@@ -1686,15 +1688,19 @@ TOOLS = [
     },
     {
         "name": "set_identity",
-        "description": "Propose a new antrozous agent id for this user. The USER "
+        "description": "Propose a new antrozous ACCOUNT name for this user -- the stem "
+        "every session id is derived from, and the name new contacts see. The USER "
         "confirms (or edits) it in an approval popup shown out-of-band; the rename "
         "only happens if they accept, so treat your 'agent_id' argument as a "
         "suggestion, not a decision. Omit it to let the popup propose a default. "
         "Once accepted it is saved to .antrozous/identity.json and takes effect "
-        "immediately, with no restart. Call when the user asks to rename their agent, "
-        "set/change their agent id, or pick a friendlier handle than the generated "
-        "one. This changes which inbox the session receives on — messages sent to the "
-        "old id will not arrive.",
+        "immediately, with no restart. Call when the user asks to rename their agent "
+        "or account, set/change their agent id, or pick a friendlier handle than the "
+        "generated one. This renames the account, not this session — THIS session "
+        "keeps sending and receiving on its own address either way. It also does not "
+        "move the alias already claimed under the old name: the relay binds an alias "
+        "to a key, first claim wins, so people who already have the old name still "
+        "reach you.",
         "inputSchema": {
             "type": "object",
             "properties": {
