@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 
 import identity
@@ -219,7 +220,16 @@ class SessionAdoptionTests(SessionRenameTest):
     def test_env_pinned_session_does_not_derive_or_register(self):
         """current_agent_id() checks $AGENT_ID first, so that is already this
         session's address. Deriving and registering a different one would
-        advertise an address the session never actually answers on."""
+        advertise an address the session never actually answers on.
+
+        An account must already exist for this to actually exercise the bug:
+        resume_or_assign_session_id() is a no-op without one regardless of
+        $AGENT_ID, which is what let an earlier, weaker version of this test
+        pass against the unfixed code too.
+        """
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        identity.mark_confirmed(self.home)
         with _env(AGENT_ID="pinned.e5ox72jb"):
             self.gate.schedule_identity_setup()
         self.assertEqual(identity.session_records(), {})
@@ -227,7 +237,13 @@ class SessionAdoptionTests(SessionRenameTest):
 
     def test_the_no_prompt_path_does_not_block_on_publishing(self):
         """This branch runs on the main read loop on every later launch; a
-        stalled relay must not delay MCP initialization by a publish call."""
+        stalled relay must not delay MCP initialization by a publish call.
+
+        Asserts on wall-clock time, not just eventual side effects: a version
+        that calls _publish_identities() inline still sets SESSION_AGENT_ID and
+        eventually calls it, just after `finish` times itself out -- so those
+        two facts alone don't prove the call didn't block.
+        """
         identity.save_fingerprint("e5ox72jb")
         identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
         identity.mark_confirmed(self.home)
@@ -240,12 +256,13 @@ class SessionAdoptionTests(SessionRenameTest):
             finish.wait(timeout=2)
 
         self.gate._publish_identities = slow_publish
+        before = time.monotonic()
         self.gate.schedule_identity_setup()
+        elapsed = time.monotonic() - before
 
+        self.assertLess(elapsed, 0.5, "adoption must not wait on the publish call")
+        self.assertIsNotNone(self.gate.SESSION_AGENT_ID)
         self.assertTrue(started.wait(timeout=1), "publish should still run")
-        self.assertIsNotNone(
-            self.gate.SESSION_AGENT_ID, "adoption must not wait on publish"
-        )
         finish.set()
 
 
