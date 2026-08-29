@@ -883,7 +883,7 @@ class OrdinalConcurrencyTests(IsolatedIdentityTest):
             )
             for _ in range(n)
         ]
-        results = [int(p.communicate()[0].strip()) for p in procs]
+        results = [int(p.communicate(timeout=10)[0].strip()) for p in procs]
         self.assertEqual(
             sorted(results),
             list(range(1, n + 1)),
@@ -967,7 +967,7 @@ class IdentityRecordLockTests(IsolatedIdentityTest):
             stderr=subprocess.PIPE,
             text=True,
         )
-        out, err = proc.communicate()
+        out, err = proc.communicate(timeout=10)
         self.assertEqual(proc.returncode, 0, "next_ordinal() child failed:\n" + err)
         return int(out.strip())
 
@@ -985,7 +985,7 @@ class IdentityRecordLockTests(IsolatedIdentityTest):
         )
 
         handed_out = self._take_ordinal()
-        rest, err = writer.communicate()
+        rest, err = writer.communicate(timeout=self.STALL + 10)
         self.assertEqual(writer.returncode, 0, "stalled writer failed:\n" + err)
 
         self.assertEqual(handed_out, 6)

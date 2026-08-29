@@ -301,8 +301,8 @@ def _identity_lock_path():
 # its own outer lock forever. set_agent_id() -> _write_identity() is exactly that
 # shape. These two make the lock reentrant within a process (depth) and mutually
 # exclusive between this process's threads (RLock) -- the latter is not academic:
-# mcp_gate runs the identity prompt, and therefore set_agent_id(), off a
-# threading.Timer while the main thread is in ensure_keys() -> save_fingerprint().
+# mcp_gate runs ensure_keys() -> save_fingerprint(), via the identity prompt, off a
+# threading.Timer while the main thread is in set_agent_id().
 _LOCAL_LOCK = threading.RLock()
 _LOCAL_DEPTH = 0
 
@@ -642,31 +642,42 @@ def mark_confirmed(base_dir):
 
 
 def _generate_and_persist():
-    """First-run creation of the global record. O_CREAT|O_EXCL, under the lock.
+    """First-run creation of the global record, under the lock.
 
-    The exclusive create makes this safe against another _generate_and_persist, but
-    not against a writer that is mid-read-modify-write: that writer read no file,
-    this one creates it, and then the writer's os.replace drops the id again. The
-    shared lock is what closes that.
+    The record is written out fully to a private temp file first, then hard-linked
+    into place: os.link fails with FileExistsError if another process already
+    created the record, the same first-writer-wins semantics O_CREAT|O_EXCL gave
+    before, but without that approach's gap -- there the file existed (as an empty
+    or partially-written destination) for the whole span between open() and
+    close(), which an unlocked reader could observe. Here the destination path
+    never exists until it already has the complete record behind it, preserving
+    the invariant _identity_lock() relies on: readers never take the lock because
+    the record only ever changes by atomic replace (or, here, atomic link).
     """
     os.makedirs(global_dir(), exist_ok=True)
     path = _global_path()
     candidate = suggest_agent_id(scope="global")
     with _identity_lock():
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "agent_id": candidate,
+                    "created_at": str(datetime.now()),
+                    "confirmed": False,
+                },
+                f,
+            )
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w") as f:
-                json.dump(
-                    {
-                        "agent_id": candidate,
-                        "created_at": str(datetime.now()),
-                        "confirmed": False,
-                    },
-                    f,
-                )
+            os.link(tmp, path)
             return candidate
         except FileExistsError:
             return _read_json(path)["agent_id"]
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def find_directory():
