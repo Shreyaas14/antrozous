@@ -83,12 +83,14 @@ class SessionRenameFixture(unittest.TestCase):
         self.gate._publish_identities = lambda: True
         self.gate.SESSION_AGENT_ID = None
         self.gate._startup_fingerprint = "kbjz3w4a"
+        self.real_find_directory = self.identity.find_directory
         self.identity.find_directory = lambda: self.base
 
     def tearDown(self):
         # Put the module back, or the next setUp captures THIS test's stub as the
         # "real" function and every later test silently exercises a lambda.
         self.gate._publish_identities = self.real_publish_identities
+        self.identity.find_directory = self.real_find_directory
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.base, ignore_errors=True)
         os.environ.pop("ANTROZOUS_HOME", None)
@@ -97,6 +99,13 @@ class SessionRenameFixture(unittest.TestCase):
         """Drive the startup prompt's answer as if the user typed `typed`."""
         self.gate._startup_pending = True
         self.gate._startup_suggested = suggested
+        # Restored on cleanup -- identity is a shared module, and leaving this
+        # patched escapes the module: any later test (in this file or another)
+        # that calls identity.live_sessions() gets THIS test's peers lambda
+        # instead of the real session registry.
+        self.addCleanup(
+            setattr, self.identity, "live_sessions", self.identity.live_sessions
+        )
         self.identity.live_sessions = lambda: dict(peers or {})
         handled = self.gate._handle_startup_reply(
             {
@@ -140,8 +149,18 @@ class SessionRenameTest(SessionRenameFixture):
             self.gate.account_agent_id()
         )
         # Renames require the user's approval in a popup; stand in for the tap.
+        # All three restored on cleanup -- left patched, they leak past this test:
+        # CLIENT_ELICITATION stuck True skips the "client can't confirm" guard,
+        # _elicit stuck auto-accepting turns every later rename into a silent
+        # yes, and tool_result stuck silent drops every later test's assertions
+        # on it.
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
         self.gate.CLIENT_ELICITATION = True
+        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
         self.gate._elicit = lambda prompt, schema: ("accept", {})
+        self.addCleanup(setattr, self.gate, "tool_result", self.gate.tool_result)
         self.gate.tool_result = lambda *a, **kw: None
         self.gate.do_set_identity(1, {"agent_id": "agent-anish.kbjz3w4a"})
 
@@ -155,6 +174,10 @@ class SessionRenameTest(SessionRenameFixture):
         message to it would silently downgrade to plaintext.
         """
         published = []
+        # Restored on cleanup -- left patched, every later real publish (this
+        # test's tearDown does not un-stub _publish_identities, only publish_keys
+        # is fixture-local here) would silently keep recording into `published`.
+        self.addCleanup(setattr, self.gate, "publish_keys", self.gate.publish_keys)
         self.gate.publish_keys = lambda addr: published.append(addr) or True
         self.gate._published.clear()
 
@@ -171,7 +194,11 @@ class SessionRenameTest(SessionRenameFixture):
         )
 
         captured = {}
+        # Restored on cleanup -- see the note in test_set_identity_publishes_...
+        # for why leaving either of these patched leaks into later tests.
+        self.addCleanup(setattr, self.gate, "tool_result", self.gate.tool_result)
         self.gate.tool_result = lambda _id, text, **kw: captured.update(text=text)
+        self.addCleanup(setattr, self.gate, "_ws_url", self.gate._ws_url)
         self.gate._ws_url = lambda a: "wss://test/ws/" + a
         self.gate.do_whoami(1, {})
         self.assertIn("scratch.kbjz3w4a", captured["text"])
@@ -381,7 +408,9 @@ class WhoamiCopyTests(SessionRenameFixture):
         self.gate.SESSION_AGENT_ID = "anish-bot-2.e5ox72jb"
         # whoami_payload() mints a ws ticket per address via a real POST unless
         # stubbed -- harmless against a dead relay, but a developer running one
-        # locally would get live ticket mints out of a unit test.
+        # locally would get live ticket mints out of a unit test. Restored on
+        # cleanup so it does not leak past this class into later tests.
+        self.addCleanup(setattr, self.gate, "_ws_url", self.gate._ws_url)
         self.gate._ws_url = lambda a: "wss://test/ws/" + a
 
     def test_note_does_not_claim_mail_goes_out_as_the_account(self):
@@ -430,6 +459,9 @@ class SetIdentityAccountTests(SessionRenameFixture):
 
     def rename_to(self, name):
         real = self.gate._elicit
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
         self.gate.CLIENT_ELICITATION = True
         self.gate._elicit = lambda message, schema=None: (
             "accept",
