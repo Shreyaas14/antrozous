@@ -19,6 +19,12 @@ sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, _HERE)
 import identity
 
+FALLBACK_ANNOUNCEMENT = (
+    "antrozous: could not read its identity state this session -- something in "
+    "~/.antrozous is missing, corrupt, or unreadable. Messaging is unavailable "
+    "until this is fixed. This is not silent good news; please check."
+)
+
 FALLBACK_DIRECTIVE = (
     "ANTROZOUS: this session's agent id is being chosen by a popup the gate raises "
     "at startup (saved default: %s). Do NOT call set_identity preemptively — that "
@@ -170,39 +176,51 @@ def will_prompt(info):
 
 
 if __name__ == "__main__":
-    info = identity.describe(identity.find_directory())
-    agent_id = info["agent_id"]
-    context = "ANTROZOUS: this session's agent id is %s (source: %s)." % (
-        agent_id,
-        info["source"],
-    )
-
-    # Listening is orthogonal to how the id was resolved, so this applies on both
-    # the env-pinned path below and the normal one.
-    resume_line, resume_context = listener_resume()
-
-    if info["source"] == "env":
-        line = "antrozous: Agent ID %s (from $AGENT_ID)" % agent_id
-        if info["shadowed"]:
-            line += " — overriding saved id %s; unset AGENT_ID to use that one." % (
-                info["shadowed"],
-            )
-        emit(line + resume_line, context + resume_context)
-        sys.exit(0)
-
-    peers = {p: a for p, a in identity.live_sessions().items()}
-    suggested = identity.account_agent_id(identity.find_directory())
-    if will_prompt(info):
-        line = (
-            "antrozous: choosing your Agent ID — a prompt will appear %s "
-            "(suggested: %s). No need to type anything; just wait for it."
-            % (human_delay(startup_delay()), suggested)
+    # A crashed SessionStart hook stops the session from starting, and
+    # identity.describe() -- the core resolution function mcp_gate also depends
+    # on -- is deliberately left to raise loudly on failures elsewhere. This
+    # guard is the hook's own safety net, not a change to describe()'s contract:
+    # any unexpected exception anywhere below still has to leave the user with a
+    # systemMessage and a clean exit, built from constants alone so the fallback
+    # itself cannot be the next thing to raise.
+    try:
+        info = identity.describe(identity.find_directory())
+        agent_id = info["agent_id"]
+        context = "ANTROZOUS: this session's agent id is %s (source: %s)." % (
+            agent_id,
+            info["source"],
         )
-    else:
-        line = "antrozous: ready"
-    if peers:
-        line += "\n  Already running: %s" % ", ".join(sorted(peers.values()))
-    emit(
-        line + session_line() + resume_line,
-        (FALLBACK_DIRECTIVE % agent_id) + resume_context,
-    )
+
+        # Listening is orthogonal to how the id was resolved, so this applies on
+        # both the env-pinned path below and the normal one.
+        resume_line, resume_context = listener_resume()
+
+        if info["source"] == "env":
+            line = "antrozous: Agent ID %s (from $AGENT_ID)" % agent_id
+            if info["shadowed"]:
+                line += (
+                    " — overriding saved id %s; unset AGENT_ID to use that one."
+                    % (info["shadowed"],)
+                )
+            emit(line + resume_line, context + resume_context)
+            sys.exit(0)
+
+        peers = {p: a for p, a in identity.live_sessions().items()}
+        suggested = identity.account_agent_id(identity.find_directory())
+        if will_prompt(info):
+            line = (
+                "antrozous: choosing your Agent ID — a prompt will appear %s "
+                "(suggested: %s). No need to type anything; just wait for it."
+                % (human_delay(startup_delay()), suggested)
+            )
+        else:
+            line = "antrozous: ready"
+        if peers:
+            line += "\n  Already running: %s" % ", ".join(sorted(peers.values()))
+        emit(
+            line + session_line() + resume_line,
+            (FALLBACK_DIRECTIVE % agent_id) + resume_context,
+        )
+    except Exception:
+        emit(FALLBACK_ANNOUNCEMENT)
+        sys.exit(0)

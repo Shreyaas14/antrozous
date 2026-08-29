@@ -596,5 +596,43 @@ class SessionLineDirectTests(ListenerStateTest):
         self.assertIsInstance(line, str)
 
 
+class HookTopLevelGuardTests(ListenerStateTest):
+    """A corrupt or unreadable identity file must not crash SessionStart itself.
+
+    identity.describe() is unguarded and is the first statement of __main__, so
+    any identity-file corruption/permission failure currently propagates all the
+    way out of the process. A crashed SessionStart hook stops the session from
+    starting, so __main__ needs its own top-level guard independent of anything
+    describe() itself does or does not catch.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if os.geteuid() == 0:
+            self.skipTest("running as root defeats permission-based tests")
+
+    def test_unreadable_global_identity_does_not_crash_the_hook(self):
+        identity_json = os.path.join(self.home, "identity.json")
+        with open(identity_json, "w") as f:
+            json.dump({"agent_id": "anish-bot.e5ox72jb", "confirmed": True}, f)
+        os.chmod(identity_json, 0o000)
+        self.addCleanup(os.chmod, identity_json, 0o600)
+
+        result = subprocess.run(
+            [sys.executable, HOOK],
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ, ANTROZOUS_HOME=self.home, USER="testuser", AGENT_ID=""
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("systemMessage", payload)
+        self.assertIn("could not read", payload["systemMessage"].lower())
+        # The fallback must not pretend things are fine.
+        self.assertNotIn("ready", payload["systemMessage"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()
