@@ -887,5 +887,178 @@ class OrdinalConcurrencyTests(IsolatedIdentityTest):
         )
 
 
+class IdentityRecordLockTests(IsolatedIdentityTest):
+    """Every writer of ~/.antrozous/identity.json must hold the same lock.
+
+    A lock scoped to the counter alone guards counter-writer against
+    counter-writer and nothing else. save_fingerprint(), mark_confirmed() and
+    set_agent_id() each do their own read-modify-write of that same file, and at
+    startup a session runs one of those CONCURRENTLY with next_ordinal() (the gate
+    calls ensure_keys() -> save_fingerprint() on the main thread while the identity
+    prompt fires set_agent_id() off a Timer thread). Interleaved, the unrelated
+    writer reads session_counter=N, next_ordinal() persists N+1 and hands it out,
+    then the unrelated writer's write lands and puts the counter back to N. The
+    next session is then handed N+1 a second time -- and two sessions on the same
+    ordinal share an agent id, therefore a relay queue, therefore drain each
+    other's mail. That is the isolation failure the counter exists to prevent.
+
+    Real subprocesses, not threads: flock is a cross-PROCESS primitive and threads
+    would not exercise it. The interleaving is made deterministic rather than
+    hoped for -- the slow writer announces READY from inside its own
+    read-modify-write and only then is next_ordinal() launched, so a passing run
+    is a real ordering guarantee and not a lucky one.
+    """
+
+    #: How long the slow writer stalls mid-write. Only has to outlast a fresh
+    #: interpreter start plus one next_ordinal(); the READY handshake below is what
+    #: makes the ordering deterministic, so this need not be generous.
+    STALL = 1.0
+
+    def setUp(self):
+        super().setUp()
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def _child_env(self):
+        env = os.environ.copy()
+        env["ANTROZOUS_HOME"] = self.home
+        return env
+
+    def _spawn_stalled_writer(self, call):
+        """Run `call` in a child that stalls between reading and writing the record.
+
+        _write_json is the last step of every read-modify-write here, so stalling
+        inside it parks the child with a stale copy of the record in hand -- exactly
+        the window the lock has to close.
+        """
+        code = "\n".join(
+            [
+                "import sys, time",
+                "import identity",
+                "_real = identity._write_json",
+                "def stalled(path, record):",
+                "    if path == identity._global_path():",
+                "        sys.stdout.write('READY\\n')",
+                "        sys.stdout.flush()",
+                "        time.sleep(%f)" % self.STALL,
+                "    _real(path, record)",
+                "identity._write_json = stalled",
+                call,
+            ]
+        )
+        return subprocess.Popen(
+            [sys.executable, "-c", code],
+            cwd=REPO_ROOT,
+            env=self._child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _take_ordinal(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import identity; print(identity.next_ordinal())"],
+            cwd=REPO_ROOT,
+            env=self._child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out, err = proc.communicate()
+        self.assertEqual(proc.returncode, 0, "next_ordinal() child failed:\n" + err)
+        return int(out.strip())
+
+    def _assert_does_not_clobber_the_counter(self, call):
+        for _ in range(5):
+            identity.next_ordinal()
+
+        writer = self._spawn_stalled_writer(call)
+        self.addCleanup(writer.kill)
+        ready = writer.stdout.readline()
+        self.assertEqual(
+            ready.strip(),
+            "READY",
+            "the stalled writer never reached its write of the global record",
+        )
+
+        handed_out = self._take_ordinal()
+        rest, err = writer.communicate()
+        self.assertEqual(writer.returncode, 0, "stalled writer failed:\n" + err)
+
+        self.assertEqual(handed_out, 6)
+        record = identity._read_json(identity._global_path()) or {}
+        self.assertEqual(
+            record.get("session_counter"),
+            handed_out,
+            "%s overwrote the counter with its stale copy: ordinal %d was handed "
+            "out but the file says %r, so the next session gets %d again"
+            % (call, handed_out, record.get("session_counter"), handed_out),
+        )
+        self.assertEqual(identity.next_ordinal(), 7)
+
+    def test_save_fingerprint_does_not_clobber_a_concurrent_ordinal(self):
+        self._assert_does_not_clobber_the_counter(
+            'identity.save_fingerprint("27uumo4l")'
+        )
+
+    def test_set_agent_id_does_not_clobber_a_concurrent_ordinal(self):
+        self._assert_does_not_clobber_the_counter(
+            "identity.set_agent_id(%r, 'renamed.e5ox72jb')" % self.home
+        )
+
+    def test_mark_confirmed_does_not_clobber_a_concurrent_ordinal(self):
+        # mark_confirmed only writes when the record is not already confirmed, and
+        # set_agent_id leaves it confirmed; clear the flag so it really writes.
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["confirmed"] = False
+        identity._write_json(path, record)
+        self._assert_does_not_clobber_the_counter(
+            "identity.mark_confirmed(%r)" % self.home
+        )
+
+
+class WriteJsonTempPathTests(IsolatedIdentityTest):
+    """_write_json's temp file must not be shared between processes.
+
+    A single hardcoded `path + '.tmp'` means two processes writing the same target
+    write the SAME temp file, and the loser's os.replace can fire after the winner
+    already renamed it away -- a bare FileNotFoundError out of a function whose
+    whole job is to make the write atomic.
+    """
+
+    def test_temp_path_is_unique_per_process(self):
+        home = self.home
+        code = "\n".join(
+            [
+                "import identity",
+                "seen = []",
+                "_real_replace = identity.os.replace",
+                "def spy(tmp, dst):",
+                "    seen.append(tmp)",
+                "    _real_replace(tmp, dst)",
+                "identity.os.replace = spy",
+                "identity._write_json(identity._global_path(), {'agent_id': 'x'})",
+                "print(seen[0])",
+            ]
+        )
+        env = os.environ.copy()
+        env["ANTROZOUS_HOME"] = home
+        outs = []
+        for _ in range(2):
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            outs.append(proc.stdout.strip())
+        self.assertNotEqual(
+            outs[0], outs[1], "two processes shared one temp path: %r" % (outs,)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

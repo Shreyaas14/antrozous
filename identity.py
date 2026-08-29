@@ -4,12 +4,13 @@ import re
 import json
 import secrets
 import subprocess
+import threading
 
 from datetime import datetime
 
 try:
     import fcntl
-except ImportError:  # Windows has no fcntl; the counter degrades to unlocked.
+except ImportError:  # Windows has no fcntl; the identity record degrades to unlocked.
     fcntl = None
 
 GIT_EXCLUDE_PATTERN = ".antrozous/"
@@ -297,69 +298,111 @@ def account_name():
     return normalize_name(agent_name(saved)) if saved else None
 
 
-def _counter_lock_path():
-    return os.path.join(global_dir(), ".counter.lock")
+def _identity_lock_path():
+    return os.path.join(global_dir(), ".identity.lock")
+
+
+# flock is a CROSS-process primitive only: two fds on one file, even from the same
+# process, are independent lock holders, so a nested _identity_lock() would block on
+# its own outer lock forever. set_agent_id() -> _write_identity() is exactly that
+# shape. These two make the lock reentrant within a process (depth) and mutually
+# exclusive between this process's threads (RLock) -- the latter is not academic:
+# mcp_gate runs the identity prompt, and therefore set_agent_id(), off a
+# threading.Timer while the main thread is in ensure_keys() -> save_fingerprint().
+_LOCAL_LOCK = threading.RLock()
+_LOCAL_DEPTH = 0
+
+
+def _take_flock():
+    """Open the lock file and hold an exclusive flock on it. None if unavailable.
+
+    Best-effort by design: if fcntl is missing (Windows) or flock raises OSError
+    (some network filesystems), the caller proceeds WITHOUT the lock rather than
+    failing. A missing lock must never stop a session from starting; on such a
+    platform the race simply remains, which is exactly the pre-lock behavior.
+    """
+    if fcntl is None:
+        return None
+    try:
+        os.makedirs(global_dir(), exist_ok=True)
+        fd = os.open(_identity_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 @contextlib.contextmanager
-def _counter_lock():
-    """Best-effort cross-process mutex around the counter's read-modify-write.
+def _identity_lock():
+    """Cross-process mutex around the GLOBAL identity record as a whole.
 
-    A dedicated lock file, separate from identity.json and never replaced: flock
-    is scoped to the file's inode, and _write_json replaces identity.json's inode
-    on every write via os.replace, so a lock taken on that path directly would end
-    up guarding an orphaned file. This file is only ever opened and flock'd, never
+    Scoped to the record, not to the counter: save_fingerprint(), mark_confirmed(),
+    set_agent_id()/_write_identity() and _generate_and_persist() all read
+    identity.json, mutate a dict and write it back, exactly as the counter does. A
+    counter-only lock left those unguarded, so a session could read
+    session_counter=N, be overtaken by next_ordinal() persisting N+1, and then land
+    its own write and put the counter back to N -- handing N+1 out twice. Two
+    sessions on one ordinal share an agent id, hence a relay queue, hence each
+    other's mail.
+
+    A dedicated lock file, separate from identity.json and never replaced: flock is
+    scoped to the file's inode, and _write_json replaces identity.json's inode on
+    every write via os.replace, so a lock taken on that path directly would end up
+    guarding an orphaned file. This file is only ever opened and flock'd, never
     swapped out, so the lock stays meaningful across writers.
 
     flock is released by the kernel the instant the holding process exits or is
     killed, so unlike an O_CREAT|O_EXCL marker (identity.py's own primary-session
-    flag, keys.py's key file) this has no stale-lock failure mode — a process
-    SIGKILLed mid-increment cannot wedge the next session.
+    flag, keys.py's key file) this has no stale-lock failure mode -- a process
+    SIGKILLed mid-write cannot wedge the next session.
 
-    Best-effort: if fcntl is unavailable (Windows) or flock raises OSError (some
-    network filesystems), proceed WITHOUT the lock rather than failing the caller.
-    A missing lock must never stop a session from starting; on such a platform the
-    race simply remains, which is exactly today's behavior, so nothing regresses.
+    Reentrant: taking it while this thread already holds it is a no-op that runs
+    inside the existing lock, so set_agent_id() may take it and still call
+    _write_identity(), which takes it too.
     """
-    if fcntl is None:
-        yield
-        return
-    os.makedirs(global_dir(), exist_ok=True)
-    try:
-        fd = os.open(_counter_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
-    except OSError:
-        yield
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError:
-            yield
+    global _LOCAL_DEPTH
+    with _LOCAL_LOCK:
+        if _LOCAL_DEPTH:
+            _LOCAL_DEPTH += 1
+            try:
+                yield
+            finally:
+                _LOCAL_DEPTH -= 1
             return
+        fd = _take_flock()
+        _LOCAL_DEPTH = 1
         try:
             yield
         finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-    finally:
-        os.close(fd)
+            _LOCAL_DEPTH = 0
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
 
 
 def next_ordinal():
-    """Take the next session ordinal. Monotonic; never reuses a number.
+    """Take the next session ordinal.
+
+    Monotonic and collision-free wherever _identity_lock() actually locks, which is
+    every platform with a working fcntl. Where it cannot (Windows, some network
+    filesystems) it degrades to an unguarded read-modify-write and two sessions
+    started at the same instant can still be handed the same number -- so the
+    guarantee is "never reuses a number under the lock", not unconditionally.
 
     Reuse is the bug this replaces: picking the lowest ordinal not held by a LIVE
     session let a new session inherit a closed one's queue, which is the very
-    cross-session drain inbox_addresses() refuses to perform. Guarded by
-    _counter_lock() so two sessions started at nearly the same instant cannot both
-    read the same starting value and hand out the same ordinal; on a platform where
-    that lock is unavailable this degrades to the same race as before.
+    cross-session drain inbox_addresses() refuses to perform.
     """
     path = _global_path()
     os.makedirs(global_dir(), exist_ok=True)
-    with _counter_lock():
+    with _identity_lock():
         record = _read_json(path) or {}
         current = record.get("session_counter")
         nxt = (current if isinstance(current, int) and current >= 0 else 0) + 1
@@ -373,8 +416,11 @@ def seed_counter_from_records():
 
     Run once at migration: a queue already exists on the relay for those names, and
     handing the same ordinal out again would silently adopt it. Shares
-    _counter_lock() with next_ordinal() so a concurrent seed and increment cannot
-    interleave into a lost update.
+    _identity_lock() with next_ordinal() and every other writer of the record, so a
+    concurrent seed and increment cannot interleave into a lost update. The
+    session_records() scan stays OUTSIDE the lock: it reads the sessions directory,
+    not the global record, and holding the lock across it would only lengthen the
+    window other sessions wait on.
     """
     high = 0
     for rec in session_records().values():
@@ -384,7 +430,7 @@ def seed_counter_from_records():
     if high:
         path = _global_path()
         os.makedirs(global_dir(), exist_ok=True)
-        with _counter_lock():
+        with _identity_lock():
             record = _read_json(path) or {}
             if (record.get("session_counter") or 0) < high:
                 record["session_counter"] = high
@@ -393,20 +439,27 @@ def seed_counter_from_records():
 
 
 def save_fingerprint(fp):
-    """Cache the gate's key fingerprint so crypto-free callers can build full ids."""
+    """Cache the gate's key fingerprint so crypto-free callers can build full ids.
+
+    Under _identity_lock() like every other writer of the record. Unguarded, the
+    gate's startup call to this ran concurrently with the same session's
+    next_ordinal(), read a session_counter that next_ordinal() then incremented,
+    and wrote the stale value back -- handing the same ordinal to two sessions.
+    """
     if not (isinstance(fp, str) and FINGERPRINT_RE.match(fp)):
         return None
     path = _global_path()
-    record = _read_json(path) or {}
-    if record.get("fingerprint") == fp:
-        return fp
     os.makedirs(global_dir(), exist_ok=True)
-    record["fingerprint"] = fp
-    if not record.get("agent_id"):
-        record["agent_id"] = suggest_agent_id(scope="global")
-        record.setdefault("created_at", str(datetime.now()))
-        record.setdefault("confirmed", False)
-    _write_json(path, record)
+    with _identity_lock():
+        record = _read_json(path) or {}
+        if record.get("fingerprint") == fp:
+            return fp
+        record["fingerprint"] = fp
+        if not record.get("agent_id"):
+            record["agent_id"] = suggest_agent_id(scope="global")
+            record.setdefault("created_at", str(datetime.now()))
+            record.setdefault("confirmed", False)
+        _write_json(path, record)
     return fp
 
 
@@ -423,7 +476,13 @@ def _read_json(filename: str):
 
 
 def _write_json(path, record):
-    tmp = path + ".tmp"
+    # Per-process temp name. A single shared `path + ".tmp"` meant two processes
+    # writing the same target wrote the SAME temp file, so the loser's os.replace
+    # could fire after the winner had already renamed it away -- a bare
+    # FileNotFoundError out of the function whose whole job is an atomic write.
+    # _identity_lock() serializes the global record, but this also covers the
+    # per-session files under sessions_dir(), which nothing locks.
+    tmp = "%s.tmp.%d" % (path, os.getpid())
     with open(tmp, "w") as f:
         json.dump(record, f)
     os.replace(tmp, path)
@@ -491,27 +550,36 @@ def suggest_agent_id(base_dir=None, scope="global"):
 
 
 def _write_identity(path, agent_id, previous=None, confirmed=True):
-    record = {"agent_id": agent_id, "confirmed": bool(confirmed)}
-    # The fingerprint is cached here for crypto-free readers; a rename must not drop
-    # it or the hook loses the ability to build qualified ids.
-    existing = previous if previous is not None else _read_json(path)
-    if existing:
-        # A rename only replaces agent_id; none of these should reset with it.
-        # fingerprint identifies the device. session_counter is the device's
-        # ordinal high-water mark — dropping it would hand out a number that
-        # already has a queue. account_name is the user's chosen stem, set once
-        # and independent of whatever id a particular session ends up with.
-        for key in ("fingerprint", "account_name", "session_counter"):
-            if existing.get(key) is not None:
-                record[key] = existing[key]
-    if previous and previous.get("created_at"):
-        record["created_at"] = previous["created_at"]
-        record["renamed_at"] = str(datetime.now())
-        if previous.get("agent_id") and previous["agent_id"] != agent_id:
-            record["previous_agent_id"] = previous["agent_id"]
-    else:
-        record["created_at"] = str(datetime.now())
-    _write_json(path, record)
+    """Rebuild the identity record at `path` from scratch and write it.
+
+    Takes _identity_lock() even though its only callers already hold it: the lock is
+    reentrant, so the redundant take costs nothing, and it means this cannot be
+    called unguarded by a future caller who does not know the contract. Without the
+    lock a rename read a record, rebuilt it, and wrote back a session_counter that
+    another session had incremented in between.
+    """
+    with _identity_lock():
+        record = {"agent_id": agent_id, "confirmed": bool(confirmed)}
+        # The fingerprint is cached here for crypto-free readers; a rename must
+        # not drop it or the hook loses the ability to build qualified ids.
+        existing = previous if previous is not None else _read_json(path)
+        if existing:
+            # A rename only replaces agent_id; none of these should reset with it.
+            # fingerprint identifies the device. session_counter is the device's
+            # ordinal high-water mark — dropping it would hand out a number that
+            # already has a queue. account_name is the user's chosen stem, set once
+            # and independent of whatever id a particular session ends up with.
+            for key in ("fingerprint", "account_name", "session_counter"):
+                if existing.get(key) is not None:
+                    record[key] = existing[key]
+        if previous and previous.get("created_at"):
+            record["created_at"] = previous["created_at"]
+            record["renamed_at"] = str(datetime.now())
+            if previous.get("agent_id") and previous["agent_id"] != agent_id:
+                record["previous_agent_id"] = previous["agent_id"]
+        else:
+            record["created_at"] = str(datetime.now())
+        _write_json(path, record)
     return agent_id
 
 
@@ -530,57 +598,81 @@ def set_agent_id(base_dir, new_id, scope="global", drop_project_override=False):
 
     if scope == "project":
         os.makedirs(os.path.join(base_dir, ".antrozous"), exist_ok=True)
+        # Deliberately outside the lock: this shells out to git with a 2s timeout
+        # and touches only .git/info/exclude, so holding the identity lock across
+        # it would stall every other session for no protection.
         _ensure_git_excluded(base_dir)
         path = _identity_path(base_dir)
-        return _write_identity(path, canonical, previous=_read_json(path))
+        with _identity_lock():
+            return _write_identity(path, canonical, previous=_read_json(path))
 
     project_path = _identity_path(base_dir)
-    project_record = _read_json(project_path)
     path = _global_path()
     os.makedirs(global_dir(), exist_ok=True)
-    previous = _read_json(path) or (project_record if drop_project_override else None)
-    _write_identity(path, canonical, previous=previous)
+    # One lock spans the read of `previous` through the write, so a concurrent
+    # next_ordinal() cannot slip an increment in between and lose it.
+    with _identity_lock():
+        project_record = _read_json(project_path)
+        previous = _read_json(path) or (
+            project_record if drop_project_override else None
+        )
+        _write_identity(path, canonical, previous=previous)
 
-    if drop_project_override and project_record:
-        # Global write first: a failed unlink leaves us un-consolidated, not id-less.
-        try:
-            os.unlink(project_path)
-        except OSError:
-            pass
+        if drop_project_override and project_record:
+            # Global write first: a failed unlink leaves us un-consolidated, not
+            # id-less.
+            try:
+                os.unlink(project_path)
+            except OSError:
+                pass
     return canonical
 
 
 def mark_confirmed(base_dir):
-    """Keep the current id but stop prompting for it. Marks the file in force."""
-    for path in (_identity_path(base_dir), _global_path()):
-        data = _read_json(path)
-        if not (data and data.get("agent_id")):
-            continue
-        if not data.get("confirmed"):
-            data["confirmed"] = True
-            _write_json(path, data)
-        return data["agent_id"]
+    """Keep the current id but stop prompting for it. Marks the file in force.
+
+    Under _identity_lock(): this rewrites the whole record to flip one flag, so
+    unguarded it would drop any key another process wrote after its read -- the
+    session counter included.
+    """
+    with _identity_lock():
+        for path in (_identity_path(base_dir), _global_path()):
+            data = _read_json(path)
+            if not (data and data.get("agent_id")):
+                continue
+            if not data.get("confirmed"):
+                data["confirmed"] = True
+                _write_json(path, data)
+            return data["agent_id"]
     return None
 
 
 def _generate_and_persist():
+    """First-run creation of the global record. O_CREAT|O_EXCL, under the lock.
+
+    The exclusive create makes this safe against another _generate_and_persist, but
+    not against a writer that is mid-read-modify-write: that writer read no file,
+    this one creates it, and then the writer's os.replace drops the id again. The
+    shared lock is what closes that.
+    """
     os.makedirs(global_dir(), exist_ok=True)
     path = _global_path()
     candidate = suggest_agent_id(scope="global")
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w") as f:
-            json.dump(
-                {
-                    "agent_id": candidate,
-                    "created_at": str(datetime.now()),
-                    "confirmed": False,
-                },
-                f,
-            )
-        return candidate
-    except FileExistsError:
-        return _read_json(path)["agent_id"]
+    with _identity_lock():
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w") as f:
+                json.dump(
+                    {
+                        "agent_id": candidate,
+                        "created_at": str(datetime.now()),
+                        "confirmed": False,
+                    },
+                    f,
+                )
+            return candidate
+        except FileExistsError:
+            return _read_json(path)["agent_id"]
 
 
 def find_directory():
