@@ -22,3 +22,7 @@ messages.json
 # Xcode build state for the enclave helper
 helper/AntrozousHelper.xcodeproj/xcuserdata/
 helper/AntrozousHelper.xcodeproj/project.xcworkspace/
+
+# Subagent-driven-development scratch: ledger, briefs, reports, review packages.
+# Regenerable from the plan and git history; never part of the repo.
+.superpowers/
