@@ -540,6 +540,77 @@ class SetIdentityAccountTests(SessionRenameFixture):
             "agent_id had already landed on disk before the failing write",
         )
 
+    def test_session_id_survives_an_account_name_write_that_raises_oserror(self):
+        """Regression for a bug introduced by the previous fix for this exact
+        crash: the account_name failure branch used to `return` BEFORE the
+        session re-pin. By the time set_account_name runs, identity.set_agent_id
+        has already written `canonical` to the global record, so a session
+        that never adopted an id of its own (SESSION_AGENT_ID is None, not
+        declined -- the exact shape the re-pin exists for) falls through
+        current_agent_id() -> identity.resolve_agent_id(), which now reads the
+        NEW id -- silently renaming this session's own address on a rename
+        that only half-completed.
+        """
+        identity.set_agent_id(self.base, "oldname.kbjz3w4a")
+        self.assertEqual(self.gate.current_agent_id(), "oldname.kbjz3w4a")
+
+        self.addCleanup(
+            setattr, self.identity, "set_account_name", self.identity.set_account_name
+        )
+        self.identity.set_account_name = lambda name: (_ for _ in ()).throw(
+            OSError("disk full")
+        )
+
+        self.rename_to("newname")
+
+        self.assertEqual(
+            self.gate.current_agent_id(),
+            "oldname.kbjz3w4a",
+            "this session must keep its pre-rename address even though the "
+            "account id it was pinning against was already rewritten",
+        )
+
+    def test_session_id_survives_an_account_name_write_that_raises_valueerror(self):
+        """set_account_name's ValueError is independently reachable, not just
+        a theoretical catch-all alongside OSError:
+        identity.agent_name("a.bc.efgh1234") returns the whole string
+        unchanged (it fails split_agent_id's fingerprint check, since "1" is
+        not in FINGERPRINT_RE's alphabet), and normalize_name of that returns
+        None because its first dot-delimited segment ("a") is a single
+        character -- so the REAL set_account_name (no stubbing needed here)
+        raises for a canonical that normalize_agent_id had already accepted
+        and identity.set_agent_id had already written to disk.
+        """
+        identity.set_agent_id(self.base, "oldname.kbjz3w4a")
+        self.assertEqual(self.gate.current_agent_id(), "oldname.kbjz3w4a")
+
+        real_elicit = self.gate._elicit
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        self.gate._elicit = lambda message, schema=None: (
+            "accept",
+            {"agent_id": "a.bc.efgh1234"},
+        )
+        try:
+            self.gate.do_set_identity("rid-1", {"agent_id": "a.bc.efgh1234"})
+        finally:
+            self.gate._elicit = real_elicit
+
+        self.assertEqual(
+            identity._read_json(identity._global_path())["agent_id"],
+            "a.bc.efgh1234",
+            "sanity check: the agent_id write really did land despite the "
+            "account_name write raising",
+        )
+        self.assertEqual(
+            self.gate.current_agent_id(),
+            "oldname.kbjz3w4a",
+            "this session must keep its pre-rename address even though the "
+            "account id it was pinning against was already rewritten",
+        )
+
     def test_prompt_says_the_alias_does_not_move(self):
         """Exercises the RENAME branch specifically (an already-set-up
         account), not the first-run branch -- there is no alias "already

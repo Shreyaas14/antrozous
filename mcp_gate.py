@@ -1592,37 +1592,59 @@ def do_set_identity(_id, args):
     # session_counter, so the gate writes through it rather than touching the
     # global record itself. Wrapped like set_agent_id() just above: `canonical`
     # is already written to disk at this point, so an OSError here (a full
-    # disk, say) must not be allowed to propagate out of tools/call dispatch
-    # and take the whole gate down.
+    # disk, say) -- or a ValueError, independently reachable when `canonical`
+    # passes normalize_agent_id but its name portion fails the stricter
+    # normalize_name -- must not be allowed to propagate out of tools/call
+    # dispatch and take the whole gate down. Captured rather than handled
+    # inline: the re-pin below has to run regardless of whether this succeeds,
+    # so the error is reported AFTER it, not from inside this except block.
+    account_name_error = None
     if scope == "global":
         try:
             identity.set_account_name(identity.agent_name(canonical))
         except (ValueError, OSError) as e:
-            tool_result(
-                _id,
-                "Agent id saved as %s, but the account name could not be updated "
-                "(%s). Session ids may still be derived from the previous name "
-                "until set_identity is run again." % (canonical, e),
-                is_error=True,
-            )
-            return
+            account_name_error = e
 
-    # Pin this session back onto its pre-rename address. Leaving SESSION_AGENT_ID
-    # untouched is not enough on its own: a session that has never explicitly
-    # adopted an id still floats onto whatever resolve_agent_id() returns, and
-    # that fallback now resolves to the account address we just renamed --
-    # so skipping this would still silently move this session's queue, just via
-    # the fallback path instead of the old _adopt_session_id(canonical) call
-    # this replaces. env_pinned is handled by current_agent_id() itself (env
-    # always wins), and a declined session (session_before is None) must stay
-    # declined, not get opted back in as a side effect of an account rename.
+    # Pin this session back onto its pre-rename address. This has to run on
+    # EVERY exit path past this point, success or failure above -- `canonical`
+    # is already on disk regardless of whether set_account_name just raised,
+    # and current_agent_id() falls through to identity.resolve_agent_id() for
+    # any session that never explicitly adopted an id of its own
+    # (SESSION_AGENT_ID is None, not declined). Returning early from the
+    # except block above, before this ran, was exactly that: it let such a
+    # session silently start answering as the NEW name on a rename that had
+    # only half-completed -- the bug this whole task exists to prevent,
+    # reappearing on the one path nothing was testing.
+    #
+    # env_pinned is handled by current_agent_id() itself (env always wins),
+    # and a declined session (session_before is None) must stay declined, not
+    # get opted back in as a side effect of an account rename.
     if not os.environ.get("AGENT_ID", "").strip() and session_before is not None:
         _adopt_session_id(session_before)
 
-    # Publish under the NEW address immediately. Waiting for the next check_inbox
-    # leaves a window where you have already told people your new name but nothing
-    # has claimed the alias for it, so sends to the bare name fail to resolve.
+    # Publish even if account_name failed above: account_agent_id() derives
+    # from resolve_agent_id()'s "agent_id" field, not from account_name, so
+    # the account's own front-door address is ALREADY fully `canonical` at
+    # this point regardless of that failure -- only the STEM used to number
+    # brand-new sessions is what stayed stale. Withholding the publish would
+    # leave the new address's alias unclaimed on the relay even though the
+    # account record already claims to be that address, which is worse than
+    # the numbering being stale: it makes the "new" address unreachable by
+    # name for anyone the user already told about it.
     _publish_identities()
+
+    if account_name_error is not None:
+        tool_result(
+            _id,
+            "Agent id saved as %s, but the account name could not be updated "
+            "(%s). This session is unaffected -- it still sends and receives "
+            "as %s. The account's address itself is already %s; only the stem "
+            "brand-new sessions number themselves from is still the old name, "
+            "so run set_identity again to retry that part."
+            % (canonical, account_name_error, current_agent_id(), canonical),
+            is_error=True,
+        )
+        return
 
     msg = "User APPROVED. Account id is now %s (saved to %s, %s scope)." % (
         canonical,
