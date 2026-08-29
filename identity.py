@@ -292,6 +292,19 @@ def account_name():
     return normalize_name(agent_name(saved)) if saved else None
 
 
+def has_explicit_account_name():
+    """True once the account name has been recorded on purpose (set_account_name,
+    directly or via a first-run/migration prompt) rather than merely being
+    derivable from a saved agent_id.
+
+    Public so callers deciding whether to OFFER to set the account name -- the
+    legacy-ordinal migration prompt is the one that needs this -- do not have to
+    reach into _read_json(_global_path()) themselves to ask.
+    """
+    record = _read_json(_global_path()) or {}
+    return bool(normalize_name(record.get("account_name") or ""))
+
+
 def _identity_lock_path():
     return os.path.join(global_dir(), ".identity.lock")
 

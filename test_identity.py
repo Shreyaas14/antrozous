@@ -760,6 +760,25 @@ class AccountNameTests(IsolatedIdentityTest):
         self.assertIsNone(identity.account_name())
 
 
+class HasExplicitAccountNameTests(IsolatedIdentityTest):
+    """The public accessor mcp_gate's migration offer uses to decide whether the
+    account name has already been recorded on purpose, as opposed to merely
+    derived from a saved agent_id -- without it the gate would have to reach
+    into identity's private read helper to ask the same question."""
+
+    def test_false_when_nothing_is_saved(self):
+        self.assertFalse(identity.has_explicit_account_name())
+
+    def test_false_when_only_derived_from_agent_id(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.assertFalse(identity.has_explicit_account_name())
+
+    def test_true_once_set_account_name_has_run(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        identity.set_account_name("anish-bot-1")
+        self.assertTrue(identity.has_explicit_account_name())
+
+
 class SetAccountNameTests(IsolatedIdentityTest):
     def test_sets_the_name_account_name_reads_back(self):
         identity.set_account_name("anish-bot")
