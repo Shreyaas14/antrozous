@@ -657,5 +657,183 @@ class SetIdentityAccountTests(SessionRenameFixture):
         self.assertIn("whichever session already answers to that address", prompt)
 
 
+class MigrationTests(SessionRenameFixture):
+    """Existing installs may have an account name that already ends in an
+    ordinal (the author's own machine has anish-bot-1.e5ox72jb) -- a session
+    number typed into the old per-session popup before every session derived
+    its own number automatically. Left alone, sessions become
+    anish-bot-1-1, anish-bot-1-2. migration_candidate()/apply_account_migration()
+    offer, once, to strip it -- and always reseed the ordinal counter so a
+    rename cannot hand out a number some other queue already uses.
+    """
+
+    def test_trailing_ordinal_is_offered_for_stripping(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.assertEqual(self.gate.migration_candidate(), "anish-bot")
+
+    def test_a_clean_name_needs_no_migration(self):
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        self.assertIsNone(self.gate.migration_candidate())
+
+    def test_a_name_that_is_only_digits_is_left_alone(self):
+        identity.set_agent_id(self.home, "agent-42.e5ox72jb")
+        self.assertEqual(self.gate.migration_candidate(), "agent")
+
+    def test_no_account_name_yet_needs_no_migration(self):
+        self.assertIsNone(self.gate.migration_candidate())
+
+    def test_an_explicit_account_name_already_stops_the_offer(self):
+        """The second condition migration_candidate() checks: an explicit
+        account_name -- even one still ending in a number -- means a decision
+        was already recorded, and the offer must not repeat."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        identity.set_account_name("anish-bot-1")
+        self.assertIsNone(self.gate.migration_candidate())
+
+    def test_declining_keeps_the_name_verbatim(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.gate.apply_account_migration(accepted=False)
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+
+    def test_declining_stops_the_offer_repeating(self):
+        """Recording the CURRENT name on decline is what makes this a
+        one-time offer instead of one every launch."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.gate.apply_account_migration(accepted=False)
+        self.assertIsNone(self.gate.migration_candidate())
+
+    def test_accepting_strips_and_seeds_the_counter(self):
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "old.json"), "w") as f:
+            json.dump({"agent_id": "anish-bot-4.e5ox72jb", "pid": None}, f)
+        self.gate.apply_account_migration(accepted=True)
+        self.assertEqual(identity.account_name(), "anish-bot")
+        self.assertEqual(identity.next_ordinal(), 5)
+
+    def test_declining_also_seeds_the_counter(self):
+        """apply_account_migration always seeds the counter, whichever way
+        the answer went -- a decline still needs the ordinal high-water mark
+        raised above whatever ordinals earlier sessions already used."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "old.json"), "w") as f:
+            json.dump({"agent_id": "anish-bot-1-3.e5ox72jb", "pid": None}, f)
+        self.gate.apply_account_migration(accepted=False)
+        self.assertEqual(identity.next_ordinal(), 4)
+
+    def test_apply_migration_writes_through_the_locked_helper(self):
+        """Must go through identity.set_account_name(), which takes the
+        identity lock guarding session_counter -- not an unlocked
+        read/modify/write of the global record, which could lose a
+        concurrent next_ordinal() increment and hand the same ordinal to two
+        sessions."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        calls = []
+        self.addCleanup(
+            setattr, self.identity, "set_account_name", self.identity.set_account_name
+        )
+        self.identity.set_account_name = lambda name: calls.append(name) or name
+        self.gate.apply_account_migration(accepted=True)
+        self.assertEqual(calls, ["anish-bot"])
+
+    def test_offer_without_elicitation_declines_automatically(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.gate.CLIENT_ELICITATION = False
+        self.gate.offer_account_migration()
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+        self.assertIsNone(self.gate.migration_candidate())
+
+    def test_offer_with_elicitation_asks_and_applies_acceptance(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
+        self.gate._elicit = lambda message, schema=None: ("accept", {})
+        self.gate.offer_account_migration()
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_offer_with_elicitation_respects_decline(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
+        self.gate._elicit = lambda message, schema=None: ("decline", {})
+        self.gate.offer_account_migration()
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+
+    def test_offer_does_nothing_without_a_candidate(self):
+        """A clean name must not even ask -- _elicit must not be called."""
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        calls = []
+        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
+        self.gate._elicit = lambda *a, **kw: calls.append(1) or ("decline", {})
+        self.gate.offer_account_migration()
+        self.assertEqual(calls, [])
+
+    def test_popup_names_both_addresses_and_says_the_alias_does_not_move(self):
+        """Four reviews in this plan found user-facing copy that contradicted
+        the code. The truthful claim here: people who already have the old
+        (bare) name still reach this account, because the relay binds an
+        alias to a fingerprint, first claim wins, and it is never
+        reassigned -- so accepting does not move it anywhere."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        captured = {}
+
+        def fake_elicit(message, schema=None):
+            captured["message"] = message
+            return "decline", {}
+
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
+        self.gate._elicit = fake_elicit
+        self.gate.offer_account_migration()
+
+        msg = captured["message"]
+        self.assertIn("anish-bot-1.e5ox72jb", msg)
+        self.assertIn("anish-bot.e5ox72jb", msg)
+        self.assertIn("first claim wins", msg)
+        self.assertIn("does not move", msg.lower())
+
+    def test_schedule_identity_setup_seeds_before_taking_an_ordinal(self):
+        """Regression for the ordering this whole task exists to guarantee:
+        the migration decision (and its reseed) must land BEFORE
+        resume_or_assign_session_id() takes this session's own ordinal, or a
+        freshly-migrated stem could hand out a number that already has a
+        live queue on the relay under the OLD stem's numbering."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        identity.mark_confirmed(self.home)
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "old.json"), "w") as f:
+            json.dump({"agent_id": "anish-bot-1-3.e5ox72jb", "pid": None}, f)
+
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
+        self.gate._elicit = lambda message, schema=None: ("accept", {})
+
+        with _env(CLAUDE_CODE_SESSION_ID="sess-new"):
+            self.gate.schedule_identity_setup()
+
+        self.assertEqual(identity.account_name(), "anish-bot")
+        self.assertEqual(self.gate.SESSION_AGENT_ID, "anish-bot-4.e5ox72jb")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

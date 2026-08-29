@@ -621,6 +621,114 @@ def resume_or_assign_session_id():
     return new_id
 
 
+def migration_candidate():
+    """The stem a legacy account name would become, or None.
+
+    None means either the name is already clean, or an explicit account_name is
+    already on record -- the latter is what stops this offer repeating every
+    launch once a decision (accept OR decline) has been recorded.
+
+    An account name ending in a number is almost always a session ordinal
+    someone typed into the old per-session popup, before every session derived
+    its own number automatically. Left in place, sessions become
+    anish-bot-1-1, anish-bot-1-2.
+    """
+    if identity.has_explicit_account_name():
+        return None
+    name = identity.account_name()
+    if not name:
+        return None
+    match = identity.ORDINAL_SUFFIX_RE.match(name)
+    if not match:
+        return None
+    return identity.normalize_name(match.group("stem"))
+
+
+def apply_account_migration(accepted):
+    """Record the account stem -- the stripped one if accepted, the current one
+    verbatim if declined -- and ALWAYS seed the ordinal counter, whichever way
+    the answer went.
+
+    Recording a name on decline (not just on accept) is what makes the offer
+    not repeat: it gives has_explicit_account_name() something to find next
+    launch. The reseed matters on decline too: earlier sessions may already
+    have taken ordinals under whatever numbering the old, unmigrated stem
+    produced, and those queues exist on the relay whether or not this name
+    ever gets cleaned up.
+
+    Written through identity.set_account_name() rather than a direct read/
+    write of the global record: that helper takes the identity lock that also
+    guards session_counter, so this cannot race a concurrent next_ordinal()
+    and drop its increment -- which would hand the same ordinal, and the same
+    relay queue, to two sessions.
+    """
+    name = migration_candidate() if accepted else identity.account_name()
+    if name:
+        try:
+            identity.set_account_name(name)
+        except (ValueError, OSError) as e:
+            log("could not record account migration decision (%r): %s" % (name, e))
+    identity.seed_counter_from_records()
+    return name
+
+
+def offer_account_migration():
+    """Ask, once, whether to strip a legacy session ordinal off the account
+    name. Declines automatically -- rather than asking -- when the client
+    cannot show a popup, since there is no other way to get the user's answer.
+
+    Called from schedule_identity_setup's non-first-run branch, before
+    resume_or_assign_session_id(): a session must not take an ordinal before
+    apply_account_migration's reseed has run, or it could hand out a number
+    some other queue already uses.
+    """
+    candidate = migration_candidate()
+    if not candidate:
+        return
+    if not CLIENT_ELICITATION:
+        apply_account_migration(accepted=False)
+        return
+
+    current_stem = identity.account_name()
+    ordinal = current_stem.rsplit("-", 1)[1]
+    current_address = account_agent_id()
+    fingerprint = identity.split_agent_id(current_address)[1]
+    new_address = identity.compose_agent_id(candidate, fingerprint) or candidate
+
+    # "Address" (qualified, with fingerprint) and "account name" (the bare stem)
+    # are kept distinct throughout: the fingerprint suffix means the ADDRESS
+    # never literally ends in the ordinal, only the account name does, and
+    # conflating the two here is exactly the class of user-facing-text-vs-code
+    # mismatch flagged repeatedly elsewhere in this plan.
+    action, _ = _elicit(
+        "SHORTEN YOUR ANTROZOUS ADDRESS?\n\n"
+        "Your address is %s. The account name in it, %s, already ends in "
+        "'-%s' -- probably a session number typed into an older prompt, from "
+        "before every session numbered itself automatically.\n\n"
+        "Left as-is, every session's own id is built by appending another "
+        "'-<number>' onto that name: %s-<number>, doubled up.\n\n"
+        "Accept = your account name becomes %s (address: %s), so sessions "
+        "are named %s-<number>.\n"
+        "Decline = keep %s exactly as it is.\n\n"
+        "Either way, people who already have %s still reach you: the relay "
+        "binds an alias to your key's fingerprint, first claim wins, and an "
+        "alias is never reassigned to a different name -- accepting does not "
+        "move it."
+        % (
+            current_address,
+            current_stem,
+            ordinal,
+            current_stem,
+            candidate,
+            new_address,
+            candidate,
+            current_stem,
+            current_stem,
+        )
+    )
+    apply_account_migration(accepted=action == "accept")
+
+
 def schedule_identity_setup():
     """Claude Code discards elicitation received during initialization, so wait."""
     if os.environ.get("AGENT_ID", "").strip():
@@ -630,11 +738,18 @@ def schedule_identity_setup():
         # burn an ordinal every launch for an id nothing ever uses.
         return
     if not needs_account_setup():
-        # Nothing to ask. Adopt the derived id now so the session is addressable
-        # before the user's first turn. This runs on EVERY later launch, so the
-        # adoption itself stays synchronous (cheap, local file work) but the
-        # network publish is handed to a thread -- this is called straight from
-        # the main read loop, and a stalled relay must not delay tools/list etc.
+        # Offered (and, on acceptance or decline, applied and reseeded) BEFORE
+        # resume_or_assign_session_id() takes this session's own ordinal --
+        # see apply_account_migration's docstring for why the ordering matters.
+        # A no-op on every later launch once migration_candidate() is None,
+        # which is the common case: nothing to offer, nothing seeded here.
+        offer_account_migration()
+        # Nothing left to ask. Adopt the derived id now so the session is
+        # addressable before the user's first turn. This runs on EVERY later
+        # launch, so the adoption itself stays synchronous (cheap, local file
+        # work) but the network publish is handed to a thread -- this is
+        # called straight from the main read loop, and a stalled relay must
+        # not delay tools/list etc.
         chosen = resume_or_assign_session_id()
         if chosen:
             _adopt_session_id(chosen)
