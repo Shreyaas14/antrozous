@@ -1396,7 +1396,12 @@ def _identity_prompt(info, suggested, scope, drop_override):
     """(prompt, schema) for the identity popup, shared by startup and set_identity."""
     target_path = info["global_path"] if scope == "global" else info["project_path"]
 
-    notes = ""
+    notes = (
+        "\n\nRenaming changes the name new contacts see and the stem your sessions "
+        "are numbered from. It does NOT move the alias you already claimed: the "
+        "relay binds an alias to your KEY, first claim wins, so people who "
+        "already have your old name still reach you."
+    )
     if info["source"] == "env":
         notes += (
             "\n\nNOTE: $AGENT_ID=%s is set and takes precedence. Saving here updates "
@@ -1480,6 +1485,12 @@ def do_set_identity(_id, args):
     base = identity.find_directory()
     before = identity.describe(base)
     scope = "project" if (args.get("scope") or "").strip() == "project" else "global"
+    # Captured before any write: current_agent_id() falls back to
+    # identity.resolve_agent_id() whenever this session has not explicitly
+    # adopted an id of its own, so once the rename below lands that fallback
+    # would resolve to the NEW account address unless this session is pinned
+    # back onto whatever it already answered to.
+    session_before = current_agent_id()
 
     suggested = identity.normalize_agent_id(args.get("agent_id") or "") or ""
     if not suggested:
@@ -1552,17 +1563,34 @@ def do_set_identity(_id, args):
         tool_result(_id, "Could not write the identity file (%s)." % e, is_error=True)
         return
 
-    previous = current_agent_id()
-    env_pinned = bool(os.environ.get("AGENT_ID", "").strip())
-    if not env_pinned:
-        _adopt_session_id(canonical)
+    # This renames the ACCOUNT -- the stem session ids are derived from -- not this
+    # session's own address. Adopting `canonical` here (the old _adopt_session_id
+    # call) would move this session's queue onto the account address; if some
+    # OTHER live session holds the primary slot, both would then drain the same
+    # physical queue, which breaks the private-room guarantee inbox_addresses()
+    # relies on. set_account_name() takes the identity lock that also guards
+    # session_counter, so the gate writes through it rather than touching the
+    # global record itself.
+    identity.set_account_name(identity.agent_name(canonical))
+
+    # Pin this session back onto its pre-rename address. Leaving SESSION_AGENT_ID
+    # untouched is not enough on its own: a session that has never explicitly
+    # adopted an id still floats onto whatever resolve_agent_id() returns, and
+    # that fallback now resolves to the account address we just renamed --
+    # so skipping this would still silently move this session's queue, just via
+    # the fallback path instead of the old _adopt_session_id(canonical) call
+    # this replaces. env_pinned is handled by current_agent_id() itself (env
+    # always wins), and a declined session (session_before is None) must stay
+    # declined, not get opted back in as a side effect of an account rename.
+    if not os.environ.get("AGENT_ID", "").strip() and session_before is not None:
+        _adopt_session_id(session_before)
 
     # Publish under the NEW address immediately. Waiting for the next check_inbox
     # leaves a window where you have already told people your new name but nothing
     # has claimed the alias for it, so sends to the bare name fail to resolve.
     _publish_identities()
 
-    msg = "User APPROVED. Agent ID is now %s (saved to %s, %s scope)." % (
+    msg = "User APPROVED. Account id is now %s (saved to %s, %s scope)." % (
         canonical,
         target_path,
         scope,
@@ -1574,18 +1602,14 @@ def do_set_identity(_id, args):
         )
     if canonical != chosen:
         msg += " Normalized from %r." % chosen
-    if env_pinned:
-        msg += (
-            "\n\nWARNING: $AGENT_ID=%s still takes precedence, so this session "
-            "continues to send and receive as %s. Unset AGENT_ID and restart for "
-            "%s to take effect." % (previous, previous, canonical)
-        )
-    else:
-        msg += (
-            "\nThis session now sends and receives as %s; messages to the previous id "
-            "(%s) will not arrive. Its WebSocket URL is %s."
-            % (canonical, previous, _ws_url(canonical))
-        )
+    msg += (
+        "\nThis renames the account new contacts see and the stem new sessions are "
+        "numbered from. This session itself keeps sending and receiving as %s -- "
+        "it does not adopt %s. It also does NOT move the alias you already "
+        "claimed: the relay binds an alias to your key, first claim wins, so "
+        "people who already have your old name still reach you."
+        % (current_agent_id(), canonical)
+    )
     tool_result(_id, msg)
 
 

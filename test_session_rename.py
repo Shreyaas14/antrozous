@@ -422,5 +422,40 @@ class WhoamiCopyTests(SessionRenameFixture):
         self.assertIn("primary slot", out["note"].lower())
 
 
+class SetIdentityAccountTests(SessionRenameFixture):
+    """set_identity renames the ACCOUNT -- the stem session ids derive from --
+    and nothing else. A derived, ephemeral, never-handed-out session id has
+    nothing worth renaming, and renaming it out from under a primary session
+    would break the private-room guarantee (see mcp_gate.inbox_addresses)."""
+
+    def rename_to(self, name):
+        real = self.gate._elicit
+        self.gate.CLIENT_ELICITATION = True
+        self.gate._elicit = lambda message, schema=None: (
+            "accept",
+            {"agent_id": "%s.kbjz3w4a" % name},
+        )
+        try:
+            self.gate.do_set_identity("rid-1", {"agent_id": "%s.kbjz3w4a" % name})
+        finally:
+            self.gate._elicit = real
+
+    def test_rename_writes_the_account_name(self):
+        self.rename_to("newname")
+        record = identity._read_json(identity._global_path())
+        self.assertEqual(record["account_name"], "newname")
+
+    def test_rename_does_not_change_this_session_id(self):
+        before = self.gate.current_agent_id()
+        self.rename_to("newname")
+        self.assertEqual(self.gate.current_agent_id(), before)
+
+    def test_prompt_says_the_alias_does_not_move(self):
+        prompt, _ = self.gate._identity_prompt(
+            identity.describe(self.home), "newname", "global", False
+        )
+        self.assertIn("alias", prompt.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
