@@ -1375,15 +1375,19 @@ def whoami_payload():
             {"pid": p, "agent_id": a} for p, a in sorted(peers.items())
         ]
     if account != agent_id and not out["is_primary"]:
-        out["note"] = (
-            "Another live session holds the primary slot, so front-door mail to %s "
-            "is drained there, not here. This session drains %s."
+        # Appended, not assigned: out["note"] is always already set here (this
+        # condition implies account != agent_id, which is note A's own guard), and
+        # dropping note A's "give people X" / "replies come back here" half would
+        # leave the non-primary case with only the primary-slot caveat.
+        out["note"] += (
+            " Another live session holds the primary slot, so front-door mail to "
+            "%s is drained there, not here; this session only drains %s."
             % (account, agent_id)
         )
-    if source == "env" and info["agent_id"] != agent_id:
+    if source == "env" and info["shadowed"]:
         out["note"] = (
             "$AGENT_ID overrides the saved id %s; set_identity writes files but "
-            "cannot change this session's id until it is unset." % info["agent_id"]
+            "cannot change this session's id until it is unset." % info["shadowed"]
         )
     return out
 
@@ -1649,9 +1653,11 @@ TOOLS = [
     {
         "name": "whoami",
         "description": "Return this session's antrozous identity and the exact WebSocket URL to "
-        "monitor for inbound-message doorbells, as {agent_id, relay_url, ws_url}. "
-        "Call this BEFORE arming a Monitor so the ws URL matches this gate's "
-        "identity and relay.",
+        "monitor for inbound-message doorbells, as {agent_id, share_this, "
+        "sends_from, relay_url, ws_url}. share_this is the stable account address "
+        "to hand out; sends_from is the address this session's own messages "
+        "actually carry, which can differ from it. Call this BEFORE arming a "
+        "Monitor so the ws URL matches this gate's identity and relay.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {

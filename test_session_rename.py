@@ -51,7 +51,19 @@ def mock_primary(value):
         _identity.is_primary = real
 
 
-class SessionRenameTest(unittest.TestCase):
+class SessionRenameFixture(unittest.TestCase):
+    """setUp/tearDown/helpers shared by the classes below. Deliberately carries no
+    test_* methods of its own.
+
+    SessionRenameTest used to double as this fixture AND own a full test suite, so
+    every subclass (SessionAdoptionTests, FrontDoorTests, WhoamiCopyTests, ...) that
+    reused its setUp also silently re-ran that whole suite under its own fixture.
+    That is how a copy-only task (whoami's note wording) ended up responsible for
+    fixing an unrelated publish-count assertion: WhoamiCopyTests's setUp gives the
+    session and account different ids, which broke an inherited test whose literal
+    expectation assumed they matched. Subclass THIS class for setUp/helpers only.
+    """
+
     def setUp(self):
         self.home = tempfile.mkdtemp()
         os.environ["ANTROZOUS_HOME"] = self.home
@@ -97,6 +109,8 @@ class SessionRenameTest(unittest.TestCase):
     def saved(self):
         return self.identity.resolve_agent_id(self.base)
 
+
+class SessionRenameTest(SessionRenameFixture):
     def test_first_choice_is_saved(self):
         self.reply("anish-bot-1", suggested="agent-shreyaas")
         self.assertEqual(self.saved(), "anish-bot-1.kbjz3w4a")
@@ -144,12 +158,10 @@ class SessionRenameTest(unittest.TestCase):
         self.gate.publish_keys = lambda addr: published.append(addr) or True
         self.gate._published.clear()
 
-        # One publish per unique address per call — account and session may or may
-        # not be the same id, depending on the subclass's fixture.
-        per_call = len({self.gate.account_agent_id(), self.gate.current_agent_id()})
+        # Account and session are the same id here, so one publish per call.
         self.real_publish_identities()
         self.real_publish_identities()
-        self.assertEqual(len(published), 2 * per_call, "must republish, not skip")
+        self.assertEqual(len(published), 2, "must republish, not skip")
 
     def test_whoami_flags_the_mismatch(self):
         self.reply("anish-bot", suggested="agent-shreyaas")
@@ -167,7 +179,7 @@ class SessionRenameTest(unittest.TestCase):
         self.assertIn("sends as", captured["text"])
 
 
-class SessionAdoptionTests(SessionRenameTest):
+class SessionAdoptionTests(SessionRenameFixture):
     def test_first_run_still_prompts(self):
         """A fresh install has no account name, so the popup must appear."""
         self.assertTrue(self.gate.needs_account_setup())
@@ -331,7 +343,7 @@ class DeclineTest(unittest.TestCase):
         self.assertFalse(self.gate.SESSION_DECLINED)
 
 
-class FrontDoorTests(SessionRenameTest):
+class FrontDoorTests(SessionRenameFixture):
     def setUp(self):
         super().setUp()
         identity.save_fingerprint("e5ox72jb")
@@ -361,12 +373,16 @@ class FrontDoorTests(SessionRenameTest):
             self.assertEqual(gate.inbox_addresses(), ["anish-bot.e5ox72jb"])
 
 
-class WhoamiCopyTests(SessionRenameTest):
+class WhoamiCopyTests(SessionRenameFixture):
     def setUp(self):
         super().setUp()
         identity.save_fingerprint("e5ox72jb")
         identity.set_agent_id(self.base, "anish-bot.e5ox72jb")
         self.gate.SESSION_AGENT_ID = "anish-bot-2.e5ox72jb"
+        # whoami_payload() mints a ws ticket per address via a real POST unless
+        # stubbed -- harmless against a dead relay, but a developer running one
+        # locally would get live ticket mints out of a unit test.
+        self.gate._ws_url = lambda a: "wss://test/ws/" + a
 
     def test_note_does_not_claim_mail_goes_out_as_the_account(self):
         out = self.gate.whoami_payload()
@@ -378,7 +394,32 @@ class WhoamiCopyTests(SessionRenameTest):
 
     def test_sends_from_is_reported_and_is_the_session(self):
         out = self.gate.whoami_payload()
-        self.assertEqual(out["sends_from"], out["agent_id"])
+        self.assertEqual(out["sends_from"], "anish-bot-2.e5ox72jb")
+        self.assertNotEqual(out["sends_from"], out["share_this"])
+
+    def test_env_override_note_names_the_shadowed_id_not_the_env_id(self):
+        """Regression for F1's sibling bug: the $AGENT_ID note's guard compared
+        info["agent_id"] (== env, by construction) against agent_id (== env, via
+        current_agent_id()'s own env check) -- always False, so the note never
+        rendered; and had it rendered, it would have named the env id back at the
+        user instead of the saved id it claims to name.
+        """
+        identity.set_agent_id(self.base, "saved.e5ox72jb")
+        with _env(AGENT_ID="pinned.e5ox72jb"):
+            out = self.gate.whoami_payload()
+        self.assertIn("note", out)
+        self.assertIn("saved.e5ox72jb", out["note"])
+
+    def test_non_primary_note_still_names_the_front_door(self):
+        """A non-primary session used to lose the front-door advice entirely: the
+        second note branch overwrote out["note"] instead of adding to it, dropping
+        the "give people X" / "replies come back here" half.
+        """
+        with mock_primary(False):
+            out = self.gate.whoami_payload()
+        self.assertIn("drains its own queue", out["note"])
+        self.assertIn("come back to", out["note"])
+        self.assertIn("primary slot", out["note"].lower())
 
 
 if __name__ == "__main__":
