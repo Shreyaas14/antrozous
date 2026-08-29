@@ -129,6 +129,46 @@ def emit(message, context=None):
     print(json.dumps(payload))
 
 
+def session_line():
+    """One line naming this session, or '' when there is nothing settled to name.
+
+    The hook runs BEFORE the gate assigns an ordinal, so a session with no record is
+    reported as pending rather than guessed at — a guessed id that the gate then
+    contradicts is worse than no id.
+    """
+    try:
+        record = identity.session_records().get(identity.current_session_key())
+        account = identity.account_name()
+    except Exception:
+        return ""
+    if record and record.get("agent_id"):
+        line = "\n  You are %s" % record["agent_id"]
+        if account:
+            line += " (front door: %s)" % identity.account_agent_id(
+                identity.find_directory()
+            )
+        return line
+    if account:
+        return "\n  Assigning this session's id from %s." % account
+    return ""
+
+
+def will_prompt(info):
+    """Whether the gate is about to raise the account-naming popup.
+
+    Mirrors mcp_gate.needs_account_setup(): describe() itself persists an
+    unconfirmed record on a fresh install, so checking account_name() alone
+    would already see a name by the time this runs and undercount the very
+    first launch — info["needs_setup"] (the confirmed flag) is what actually
+    tracks that. It only fires on a first run now, so announcing one on every
+    later launch would promise a popup that never arrives.
+    """
+    try:
+        return bool(info.get("needs_setup")) or not identity.account_name()
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     info = identity.describe(identity.find_directory())
     agent_id = info["agent_id"]
@@ -152,14 +192,17 @@ if __name__ == "__main__":
 
     peers = {p: a for p, a in identity.live_sessions().items()}
     suggested = identity.account_agent_id(identity.find_directory())
-    line = (
-        "antrozous: choosing this session's Agent ID — a prompt will appear %s "
-        "(suggested: %s). No need to type anything; just wait for it."
-        % (
-            human_delay(startup_delay()),
-            suggested,
+    if will_prompt(info):
+        line = (
+            "antrozous: choosing your Agent ID — a prompt will appear %s "
+            "(suggested: %s). No need to type anything; just wait for it."
+            % (human_delay(startup_delay()), suggested)
         )
-    )
+    else:
+        line = "antrozous: ready"
     if peers:
         line += "\n  Already running: %s" % ", ".join(sorted(peers.values()))
-    emit(line + resume_line, (FALLBACK_DIRECTIVE % agent_id) + resume_context)
+    emit(
+        line + session_line() + resume_line,
+        (FALLBACK_DIRECTIVE % agent_id) + resume_context,
+    )

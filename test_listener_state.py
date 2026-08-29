@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
+import identity
 import listener_state
 
 SCRIPT = os.path.join(
@@ -481,6 +482,57 @@ class HookResumeTests(ListenerStateTest):
         self.assertIn("systemMessage", payload)
         # Unreadable now falls back to the default, which is on.
         self.assertIn("ON BY DEFAULT", self.context_of(payload))
+
+
+class HookAnnouncementTests(ListenerStateTest):
+    def run_hook(self, **env):
+        base = dict(
+            os.environ,
+            ANTROZOUS_HOME=self.home,
+            USER="testuser",
+            ANTROZOUS_AUTO_LISTEN="1",
+        )
+        base.update(env)
+        result = subprocess.run(
+            [sys.executable, HOOK],
+            capture_output=True,
+            text=True,
+            env=base,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_resumed_session_is_announced_with_its_full_id(self):
+        os.makedirs(os.path.join(self.home, "sessions"), exist_ok=True)
+        path = os.path.join(self.home, "sessions", "sess-a.json")
+        with open(path, "w") as f:
+            json.dump({"agent_id": "anish-bot-3.e5ox72jb", "pid": None}, f)
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-a")
+        self.assertIn("anish-bot-3.e5ox72jb", payload["systemMessage"])
+
+    def test_unknown_session_does_not_invent_an_ordinal(self):
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertNotIn("-1.", payload["systemMessage"])
+
+    def test_a_later_run_does_not_announce_a_popup(self):
+        """Task 4 deleted the per-session popup. The hook must stop promising it."""
+        identity_json = os.path.join(self.home, "identity.json")
+        with open(identity_json, "w") as f:
+            json.dump(
+                {
+                    "agent_id": "anish-bot.e5ox72jb",
+                    "account_name": "anish-bot",
+                    "fingerprint": "e5ox72jb",
+                    "confirmed": True,
+                },
+                f,
+            )
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertNotIn("prompt will appear", payload["systemMessage"])
+
+    def test_a_first_run_still_announces_the_popup(self):
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertIn("prompt will appear", payload["systemMessage"])
 
 
 if __name__ == "__main__":
