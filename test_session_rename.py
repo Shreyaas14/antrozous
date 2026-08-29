@@ -144,10 +144,12 @@ class SessionRenameTest(unittest.TestCase):
         self.gate.publish_keys = lambda addr: published.append(addr) or True
         self.gate._published.clear()
 
-        # Account and session are the same id here, so one publish per call.
+        # One publish per unique address per call — account and session may or may
+        # not be the same id, depending on the subclass's fixture.
+        per_call = len({self.gate.account_agent_id(), self.gate.current_agent_id()})
         self.real_publish_identities()
         self.real_publish_identities()
-        self.assertEqual(len(published), 2, "must republish, not skip")
+        self.assertEqual(len(published), 2 * per_call, "must republish, not skip")
 
     def test_whoami_flags_the_mismatch(self):
         self.reply("anish-bot", suggested="agent-shreyaas")
@@ -162,7 +164,7 @@ class SessionRenameTest(unittest.TestCase):
         self.gate.do_whoami(1, {})
         self.assertIn("scratch.kbjz3w4a", captured["text"])
         self.assertIn("anish-bot.kbjz3w4a", captured["text"])
-        self.assertIn("go out as", captured["text"])
+        self.assertIn("sends as", captured["text"])
 
 
 class SessionAdoptionTests(SessionRenameTest):
@@ -357,6 +359,26 @@ class FrontDoorTests(SessionRenameTest):
         gate.SESSION_AGENT_ID = "anish-bot.e5ox72jb"
         with mock_primary(True):
             self.assertEqual(gate.inbox_addresses(), ["anish-bot.e5ox72jb"])
+
+
+class WhoamiCopyTests(SessionRenameTest):
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.base, "anish-bot.e5ox72jb")
+        self.gate.SESSION_AGENT_ID = "anish-bot-2.e5ox72jb"
+
+    def test_note_does_not_claim_mail_goes_out_as_the_account(self):
+        out = self.gate.whoami_payload()
+        self.assertNotIn("your messages go out as", json.dumps(out).lower())
+
+    def test_share_this_is_the_front_door(self):
+        out = self.gate.whoami_payload()
+        self.assertEqual(out["share_this"], out["account_agent_id"])
+
+    def test_sends_from_is_reported_and_is_the_session(self):
+        out = self.gate.whoami_payload()
+        self.assertEqual(out["sends_from"], out["agent_id"])
 
 
 if __name__ == "__main__":

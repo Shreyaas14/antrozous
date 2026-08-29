@@ -1309,9 +1309,6 @@ def _ws_url(agent_id):
 
 
 def do_whoami(_id, _args):
-    # ws_url derives from THIS gate's RELAY_URL and agent_id, so a Monitor armed on
-    # it can never point at a different relay than check_inbox uses.
-    info = identity.describe(identity.find_directory())
     agent_id = current_agent_id()
     if agent_id is None:
         # Declined at startup. Report the state plainly instead of inventing an id;
@@ -1331,6 +1328,15 @@ def do_whoami(_id, _args):
             ),
         )
         return
+    tool_result(_id, json.dumps(whoami_payload()))
+
+
+def whoami_payload():
+    """The whoami dict. Split out of do_whoami so it can be asserted on directly."""
+    # ws_url derives from THIS gate's RELAY_URL and agent_id, so a Monitor armed on
+    # it can never point at a different relay than check_inbox uses.
+    info = identity.describe(identity.find_directory())
+    agent_id = current_agent_id()
     account = account_agent_id()
     source = (
         "env"
@@ -1344,6 +1350,7 @@ def do_whoami(_id, _args):
         "agent_id": agent_id,
         "account_agent_id": account,
         "share_this": account,
+        "sends_from": agent_id,
         "source": source,
         "is_primary": identity.is_primary(),
         "polls_inboxes": polls,
@@ -1353,13 +1360,11 @@ def do_whoami(_id, _args):
         "account_ws_url": _ws_url(account),
     }
     if account != agent_id:
-        # Sends, key publishing and the alias all use the ACCOUNT address, so a
-        # differing session name is exactly the state where someone hands out a
-        # name nobody ever sees on their messages. Say it outright.
         out["note"] = (
-            "This session is named %s, but your messages go out as %s — that is the "
-            "address to give people. Rename the account with set_identity if you "
-            "wanted %s to be your real address." % (agent_id, account, agent_id)
+            "Give people %s — that is your front door, and it stays the same in "
+            "every session. This session sends as %s and drains its own queue; "
+            "replies to what you send here come back to %s."
+            % (account, agent_id, agent_id)
         )
     if KEYS_AVAILABLE:
         out["key_backend"] = keys.BACKEND
@@ -1371,21 +1376,16 @@ def do_whoami(_id, _args):
         ]
     if account != agent_id and not out["is_primary"]:
         out["note"] = (
-            "Another session holds the primary slot, so mail sent to %s is read "
-            "there, not here. This session reads %s." % (account, agent_id)
+            "Another live session holds the primary slot, so front-door mail to %s "
+            "is drained there, not here. This session drains %s."
+            % (account, agent_id)
         )
     if source == "env" and info["agent_id"] != agent_id:
         out["note"] = (
             "$AGENT_ID overrides the saved id %s; set_identity writes files but "
             "cannot change this session's id until it is unset." % info["agent_id"]
         )
-    elif info["source"] == "project" and info["shadowed"]:
-        out["note"] = (
-            "A project-scoped identity at %s overrides the global id %s, so this "
-            "directory is a different agent from other directories."
-            % (info["project_path"], info["shadowed"])
-        )
-    tool_result(_id, json.dumps(out))
+    return out
 
 
 def _identity_prompt(info, suggested, scope, drop_override):
