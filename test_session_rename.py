@@ -38,6 +38,19 @@ def _env(**overrides):
                 os.environ[k] = v
 
 
+@contextlib.contextmanager
+def mock_primary(value):
+    """Patch identity.is_primary, which is what inbox_addresses consults."""
+    import identity as _identity
+
+    real = _identity.is_primary
+    _identity.is_primary = lambda: value
+    try:
+        yield
+    finally:
+        _identity.is_primary = real
+
+
 class SessionRenameTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -314,6 +327,36 @@ class DeclineTest(unittest.TestCase):
         self.gate._adopt_session_id("later.kbjz3w4a")
         self.assertEqual(self.gate.current_agent_id(), "later.kbjz3w4a")
         self.assertFalse(self.gate.SESSION_DECLINED)
+
+
+class FrontDoorTests(SessionRenameTest):
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.base, "anish-bot.e5ox72jb")
+
+    def test_non_primary_reads_only_its_own_queue(self):
+        gate = self.gate
+        gate.SESSION_AGENT_ID = "anish-bot-2.e5ox72jb"
+        with mock_primary(False):
+            self.assertEqual(
+                gate.inbox_addresses(), ["anish-bot-2.e5ox72jb"]
+            )
+
+    def test_primary_also_reads_the_front_door(self):
+        gate = self.gate
+        gate.SESSION_AGENT_ID = "anish-bot-2.e5ox72jb"
+        with mock_primary(True):
+            self.assertEqual(
+                gate.inbox_addresses(),
+                ["anish-bot-2.e5ox72jb", "anish-bot.e5ox72jb"],
+            )
+
+    def test_primary_does_not_duplicate_when_the_ids_match(self):
+        gate = self.gate
+        gate.SESSION_AGENT_ID = "anish-bot.e5ox72jb"
+        with mock_primary(True):
+            self.assertEqual(gate.inbox_addresses(), ["anish-bot.e5ox72jb"])
 
 
 if __name__ == "__main__":

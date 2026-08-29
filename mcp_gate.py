@@ -538,17 +538,24 @@ def account_agent_id():
 
 
 def inbox_addresses():
-    """This session polls its own queue and nothing else.
+    """The queues this session drains: its own, plus the front door if primary.
 
-    Sessions are isolated on purpose: two tabs on one device are two separate
-    agents, and one must never surface — or consume — the other's mail. A session
-    draining its neighbours would also mean approving messages on their behalf,
-    which is the one decision this gate never takes for you.
+    Session queues are PRIVATE — a session never reads another live session's mail,
+    because draining it would mean approving that session's messages on its behalf.
 
-    Queues left behind by a rename or a closed tab are NOT swept up here. They are
-    reported by other_queues() and drained only when the user asks.
+    The account address is different. It is the front door: the alias resolves to it
+    (/resolve maps a bare name to a fingerprint and the sender composes
+    <name>.<fingerprint>), first-claim-wins means it can never be repointed at a
+    session, and so it belongs to no session. If nothing drained it, cold mail from
+    a new contact would be invisible. Exactly one live session does — the primary.
     """
-    return [current_agent_id()]
+    session = current_agent_id()
+    addresses = [session]
+    if identity.is_primary():
+        account = account_agent_id()
+        if account and account != session:
+            addresses.append(account)
+    return addresses
 
 
 def other_queues():
