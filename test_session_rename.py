@@ -7,11 +7,33 @@ you could see — you'd tell people "I'm anish-bot" while every message you sent
 anish-bot-1.
 """
 
+import contextlib
 import json
 import os
 import shutil
 import tempfile
 import unittest
+
+import identity
+
+
+@contextlib.contextmanager
+def _env(**overrides):
+    """Set/clear env vars for the duration of a block. A value of None unsets."""
+    saved = {k: os.environ.get(k) for k in overrides}
+    try:
+        for k, v in overrides.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 class SessionRenameTest(unittest.TestCase):
@@ -64,43 +86,12 @@ class SessionRenameTest(unittest.TestCase):
         self.reply("anish-bot-1", suggested="agent-shreyaas")
         self.assertEqual(self.saved(), "anish-bot-1.kbjz3w4a")
 
-    def test_later_launches_only_name_the_tab(self):
-        """Anish's bug, now the documented rule rather than an accident.
-
-        Typing a name at launch after the first run must NOT move your address —
-        set_identity is the only thing that renames you.
-        """
-        self.reply("anish-bot-1", suggested="agent-shreyaas")
-        self.identity.mark_confirmed(self.base)
-
-        self.reply("agent-anish", suggested="anish-bot-1")
-        self.assertEqual(self.saved(), "anish-bot-1.kbjz3w4a", "address must not move")
-        self.assertEqual(self.gate.SESSION_AGENT_ID, "agent-anish.kbjz3w4a")
-
-    def test_a_second_tab_names_itself_without_renaming_the_account(self):
-        """Two Claude sessions on one machine need distinct session ids."""
-        self.reply("anish-bot", suggested="agent-shreyaas")
-        self.identity.mark_confirmed(self.base)
-
-        self.reply(
-            "scratch", suggested="anish-bot-2", peers={99999: "anish-bot.kbjz3w4a"}
-        )
-        self.assertEqual(self.saved(), "anish-bot.kbjz3w4a", "account must not move")
-        self.assertEqual(self.gate.SESSION_AGENT_ID, "scratch.kbjz3w4a")
-
     def test_the_prompt_says_which_one_it_is(self):
         """The wording has to match the behaviour, or people rename nothing."""
         info = self.identity.describe(self.base)
         first, _ = self.gate._session_prompt(info, "agent-shreyaas", "kbjz3w4a", {})
         self.assertIn("FIRST run", first)
         self.assertIn("YOUR ADDRESS", first)
-
-        self.reply("anish-bot", suggested="agent-shreyaas")
-        self.identity.mark_confirmed(self.base)
-        info = self.identity.describe(self.base)
-        later, _ = self.gate._session_prompt(info, "anish-bot-2", "kbjz3w4a", {})
-        self.assertIn("THIS TAB only", later)
-        self.assertIn("set_identity", later)
 
     def test_set_identity_publishes_under_the_new_name(self):
         """A rename has to claim the new alias, not wait for the next check_inbox.
@@ -151,6 +142,46 @@ class SessionRenameTest(unittest.TestCase):
         self.assertIn("scratch.kbjz3w4a", captured["text"])
         self.assertIn("anish-bot.kbjz3w4a", captured["text"])
         self.assertIn("go out as", captured["text"])
+
+
+class SessionAdoptionTests(SessionRenameTest):
+    def test_first_run_still_prompts(self):
+        """A fresh install has no account name, so the popup must appear."""
+        self.assertTrue(self.gate.needs_account_setup())
+
+    def test_later_runs_do_not_prompt(self):
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        identity.mark_confirmed(self.home)
+        self.assertFalse(self.gate.needs_account_setup())
+
+    def test_new_session_takes_the_next_ordinal(self):
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        with _env(CLAUDE_CODE_SESSION_ID="sess-a"):
+            first = self.gate.resume_or_assign_session_id()
+        with _env(CLAUDE_CODE_SESSION_ID="sess-b"):
+            second = self.gate.resume_or_assign_session_id()
+        self.assertEqual(first, "anish-bot-1.e5ox72jb")
+        self.assertEqual(second, "anish-bot-2.e5ox72jb")
+
+    def test_resumed_session_keeps_its_id(self):
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        with _env(CLAUDE_CODE_SESSION_ID="sess-a"):
+            first = self.gate.resume_or_assign_session_id()
+            identity.unregister_session()
+            again = self.gate.resume_or_assign_session_id()
+        self.assertEqual(first, again)
+
+    def test_a_resumed_session_does_not_burn_an_ordinal(self):
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        with _env(CLAUDE_CODE_SESSION_ID="sess-a"):
+            self.gate.resume_or_assign_session_id()
+            self.gate.resume_or_assign_session_id()
+        self.assertEqual(
+            identity._read_json(identity._global_path())["session_counter"], 1
+        )
 
 
 class DeclineTest(unittest.TestCase):

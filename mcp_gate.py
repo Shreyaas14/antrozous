@@ -586,8 +586,44 @@ def _adopt_session_id(agent_id):
     return agent_id
 
 
+def needs_account_setup():
+    """True only on a first run — no confirmed account name exists yet."""
+    if os.environ.get("AGENT_ID", "").strip():
+        return False
+    info = identity.describe(identity.find_directory())
+    return bool(info["needs_setup"]) or not identity.account_name()
+
+
+def resume_or_assign_session_id():
+    """This session's address: its own record if it has one, else the next ordinal.
+
+    Reusing the record is what makes `claude --resume` come back to the same queue,
+    and it is why a resumed session must not take a new ordinal. The freshly derived
+    id is registered immediately (not left to the caller) so a second call for the
+    same session — including one that never goes through _adopt_session_id — finds
+    the same record instead of burning another ordinal.
+    """
+    existing = identity.session_records().get(identity.current_session_key())
+    if existing and existing.get("agent_id"):
+        return existing["agent_id"]
+    if not identity.account_name():
+        return None
+    new_id = identity.session_agent_id(identity.next_ordinal())
+    if new_id:
+        identity.register_session(new_id)
+    return new_id
+
+
 def schedule_identity_setup():
     """Claude Code discards elicitation received during initialization, so wait."""
+    if not needs_account_setup():
+        # Nothing to ask. Adopt the derived id now so the session is addressable
+        # before the user's first turn.
+        chosen = resume_or_assign_session_id()
+        if chosen:
+            _adopt_session_id(chosen)
+            _publish_identities()
+        return
     if STARTUP_DELAY <= 0:
         offer_identity_setup()
         return
@@ -598,19 +634,15 @@ def schedule_identity_setup():
 
 def _session_prompt(info, suggested_name, fp, peers):
     full_id = identity.compose_agent_id(suggested_name, fp) or suggested_name
-    # First run names YOU; later runs name the tab. Saying "session only" on the
-    # first run was simply false, and saying it quietly on later runs let people
-    # believe they had renamed themselves when they had not.
-    if info["needs_setup"]:
-        where = (
-            "This is your FIRST run, so this name becomes YOUR ADDRESS — the one you "
-            "give other people. You can change it later with the set_identity tool."
-        )
-    else:
-        where = (
-            "Names THIS TAB only. Your address stays %s no matter what you type here "
-            "— use the set_identity tool to change that." % info["agent_id"]
-        )
+    # The popup only ever fires on a first run now — every later session derives its
+    # id silently. So there is no "names the tab" branch left to explain here.
+    where = (
+        "This is your FIRST run, so this name becomes YOUR ADDRESS — the one you "
+        "give other people. It is chosen once. Each session you open is numbered "
+        "from it automatically (%s-1, %s-2, ...), and you are never asked again. "
+        "Use the set_identity tool later if you want to change it."
+        % (suggested_name, suggested_name)
+    )
     peer_note = ""
     if peers:
         peer_note = "\n\nOther sessions running right now:\n" + "\n".join(
@@ -655,7 +687,8 @@ def _session_prompt(info, suggested_name, fp, peers):
 
 
 def offer_identity_setup():
-    """Ask for this session's id. Fires every launch so each tab can differ."""
+    """Ask for the account name. schedule_identity_setup only calls this on a
+    first run — every later session derives its id without asking."""
     global _startup_pending, _startup_suggested, _startup_fingerprint
     if not CLIENT_ELICITATION:
         return
@@ -675,9 +708,9 @@ def offer_identity_setup():
     _startup_fingerprint = identity.saved_fingerprint() or ensure_keys()
     info = identity.describe(base_dir)
     peers = identity.live_sessions()
-    _startup_suggested = identity.account_name() or identity.agent_name(
-        info["agent_id"]
-    )
+    # This only ever runs on a first run (schedule_identity_setup's gate), so there
+    # is no account name yet to suggest — just the placeholder id's name part.
+    _startup_suggested = identity.agent_name(info["agent_id"])
     prompt, schema = _session_prompt(
         info, _startup_suggested, _startup_fingerprint, peers
     )
@@ -733,34 +766,32 @@ def _handle_startup_reply(m):
     if isinstance(typed, str) and typed.strip():
         chosen_name = typed.strip()
 
+    info = identity.describe(base_dir)
     name = identity.normalize_name(chosen_name)
     if name is None:
-        log("rejected session name %r; keeping saved id" % chosen_name)
+        log("rejected account name %r; keeping saved id" % chosen_name)
         _adopt_session_id(identity.resolve_agent_id(base_dir))
         _publish_identities()
         return True
 
-    full_id = identity.compose_agent_id(name, _startup_fingerprint) or name
-    _adopt_session_id(full_id)
-    info = identity.describe(base_dir)
-
-    # The FIRST run names you; every launch after that names the tab. Renaming your
-    # actual address is set_identity's job, deliberately — a name typed at launch
-    # should never silently become the address you hand out, and sessions have to be
-    # free to differ so agents on one machine can message each other.
-    if info["needs_setup"]:
-        try:
-            identity.set_agent_id(
-                base_dir, full_id, drop_project_override=info["source"] == "project"
-            )
-        except (ValueError, OSError) as e:
-            log("could not save default id:", e)
-    elif full_id != account_agent_id():
-        log(
-            "session named %s; account address stays %s (set_identity to change it)"
-            % (full_id, account_agent_id())
+    # This prompt only ever fires on a first run, so what is accepted here names the
+    # ACCOUNT, not this one tab. The account name is written FIRST, and only then is
+    # this session's own id derived from it — deriving before the write would read a
+    # stale or absent stem.
+    account_id = identity.compose_agent_id(name, _startup_fingerprint) or name
+    try:
+        identity.set_agent_id(
+            base_dir, account_id, drop_project_override=info["source"] == "project"
         )
-    log("session id set to", full_id)
+        record = identity._read_json(identity._global_path()) or {}
+        record["account_name"] = name
+        identity._write_json(identity._global_path(), record)
+    except (ValueError, OSError) as e:
+        log("could not save account name:", e)
+
+    chosen = resume_or_assign_session_id()
+    _adopt_session_id(chosen or account_id)
+    log("account is %s; this session is %s" % (account_id, chosen or account_id))
     # AFTER the saved default is written: the account address derives from it, and
     # publishing earlier would advertise keys under the pre-rename address.
     _publish_identities()
