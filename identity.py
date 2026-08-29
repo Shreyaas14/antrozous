@@ -641,6 +641,28 @@ def mark_confirmed(base_dir):
     return None
 
 
+def set_account_name(name):
+    """Record the human-chosen stem every session id is derived from.
+
+    Under _identity_lock() like every other writer of the global record.
+    Unguarded, this is a read-modify-write racing next_ordinal()'s own
+    read-modify-write of the same file: whichever writes last wins outright,
+    silently dropping the other's change -- and when the dropped change is a
+    freshly incremented session_counter, the ordinal it protected gets handed
+    out again to the next session that asks.
+    """
+    normalized = normalize_name(name)
+    if normalized is None:
+        raise ValueError("invalid account name %r" % (name,))
+    path = _global_path()
+    os.makedirs(global_dir(), exist_ok=True)
+    with _identity_lock():
+        record = _read_json(path) or {}
+        record["account_name"] = normalized
+        _write_json(path, record)
+    return normalized
+
+
 def _generate_and_persist():
     """First-run creation of the global record. O_CREAT|O_EXCL, under the lock.
 

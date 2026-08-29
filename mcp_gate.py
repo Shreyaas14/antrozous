@@ -616,13 +616,22 @@ def resume_or_assign_session_id():
 
 def schedule_identity_setup():
     """Claude Code discards elicitation received during initialization, so wait."""
+    if os.environ.get("AGENT_ID", "").strip():
+        # current_agent_id() checks $AGENT_ID first, so it is already this
+        # session's address. Deriving and registering a different one here would
+        # advertise an address the session never actually answers on, and would
+        # burn an ordinal every launch for an id nothing ever uses.
+        return
     if not needs_account_setup():
         # Nothing to ask. Adopt the derived id now so the session is addressable
-        # before the user's first turn.
+        # before the user's first turn. This runs on EVERY later launch, so the
+        # adoption itself stays synchronous (cheap, local file work) but the
+        # network publish is handed to a thread -- this is called straight from
+        # the main read loop, and a stalled relay must not delay tools/list etc.
         chosen = resume_or_assign_session_id()
         if chosen:
             _adopt_session_id(chosen)
-            _publish_identities()
+            threading.Thread(target=_publish_identities, daemon=True).start()
         return
     if STARTUP_DELAY <= 0:
         offer_identity_setup()
@@ -632,41 +641,36 @@ def schedule_identity_setup():
     t.start()
 
 
-def _session_prompt(info, suggested_name, fp, peers):
+def _session_prompt(suggested_name, fp, peers):
+    """The first-run popup's copy. There is no other run this fires on, so every
+    line below has to be true of naming the ACCOUNT — not a per-tab choice."""
     full_id = identity.compose_agent_id(suggested_name, fp) or suggested_name
-    # The popup only ever fires on a first run now — every later session derives its
-    # id silently. So there is no "names the tab" branch left to explain here.
-    where = (
-        "This is your FIRST run, so this name becomes YOUR ADDRESS — the one you "
-        "give other people. It is chosen once. Each session you open is numbered "
-        "from it automatically (%s-1, %s-2, ...), and you are never asked again. "
-        "Use the set_identity tool later if you want to change it."
-        % (suggested_name, suggested_name)
-    )
     peer_note = ""
     if peers:
         peer_note = "\n\nOther sessions running right now:\n" + "\n".join(
             "  - %s (pid %d)" % (a, p) for p, a in sorted(peers.items())
         )
-    account = identity.account_agent_id(identity.find_directory())
     prompt = (
-        "THIS SESSION'S ANTROZOUS AGENT ID\n\n"
-        "This session: %s\n"
-        "Your address: %s   <- give THIS to other people\n\n"
-        "%s%s\n\n"
-        "The %s suffix is a digest of your identity key, so someone else picking the "
-        "same name still gets a different id and cannot receive your messages.\n\n"
-        "Your address works from any of your sessions. The session id above is for "
-        "addressing this specific tab, e.g. one agent messaging another.\n\n"
+        "NAME YOUR ANTROZOUS ACCOUNT\n\n"
+        "This is your FIRST run, so the name below becomes YOUR ADDRESS — the one "
+        "you give other people. Accepting %s would save it as %s.\n\n"
+        "It is chosen once. Every session you open after this one is numbered "
+        "from it automatically (%s-1, %s-2, ...) with no further prompts. Use the "
+        "set_identity tool later if you want to change the account name.\n\n"
+        "The %s suffix is a digest of your identity key, so someone else picking "
+        "the same name still gets a different address and cannot receive your "
+        "messages.%s\n\n"
         "Type just the name below (a-z, 0-9, dash, underscore).\n\n"
-        "Accept = use this id.   Decline = use %s."
+        "Accept = save this as your account address.   "
+        "Decline = this session gets no address at all (set_identity opts back "
+        "in later)."
         % (
+            suggested_name,
             full_id,
-            account,
-            where,
-            peer_note,
+            suggested_name,
+            suggested_name,
             ("." + fp) if fp else "fingerprint",
-            info["agent_id"],
+            peer_note,
         )
     )
     schema = {
@@ -674,7 +678,7 @@ def _session_prompt(info, suggested_name, fp, peers):
         "properties": {
             "name": {
                 "type": "string",
-                "title": "Name for this session",
+                "title": "Name for your account",
                 "description": "Your key fingerprint is appended automatically.",
                 "default": suggested_name,
                 "minLength": 2,
@@ -711,9 +715,7 @@ def offer_identity_setup():
     # This only ever runs on a first run (schedule_identity_setup's gate), so there
     # is no account name yet to suggest — just the placeholder id's name part.
     _startup_suggested = identity.agent_name(info["agent_id"])
-    prompt, schema = _session_prompt(
-        info, _startup_suggested, _startup_fingerprint, peers
-    )
+    prompt, schema = _session_prompt(_startup_suggested, _startup_fingerprint, peers)
     _startup_pending = True
     send(
         {
@@ -783,9 +785,7 @@ def _handle_startup_reply(m):
         identity.set_agent_id(
             base_dir, account_id, drop_project_override=info["source"] == "project"
         )
-        record = identity._read_json(identity._global_path()) or {}
-        record["account_name"] = name
-        identity._write_json(identity._global_path(), record)
+        identity.set_account_name(name)
     except (ValueError, OSError) as e:
         log("could not save account name:", e)
 

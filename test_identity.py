@@ -760,6 +760,34 @@ class AccountNameTests(IsolatedIdentityTest):
         self.assertIsNone(identity.account_name())
 
 
+class SetAccountNameTests(IsolatedIdentityTest):
+    def test_sets_the_name_account_name_reads_back(self):
+        identity.set_account_name("anish-bot")
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_normalizes_the_name(self):
+        identity.set_account_name("  Anish-Bot  ")
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_rejects_an_illegal_name(self):
+        with self.assertRaises(ValueError):
+            identity.set_account_name("!!!")
+
+    def test_preserves_the_rest_of_the_record(self):
+        """A read-modify-write that drops session_counter would hand out an
+        ordinal a second time -- the exact bug the identity lock exists to stop."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.next_ordinal()
+        identity.next_ordinal()
+
+        identity.set_account_name("anish-bot")
+
+        record = self.global_record()
+        self.assertEqual(record["account_name"], "anish-bot")
+        self.assertEqual(record["fingerprint"], "e5ox72jb")
+        self.assertEqual(record["session_counter"], 2)
+
+
 class SessionAgentIdTests(IsolatedIdentityTest):
     def setUp(self):
         super().setUp()

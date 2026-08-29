@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
 import identity
@@ -88,10 +89,16 @@ class SessionRenameTest(unittest.TestCase):
 
     def test_the_prompt_says_which_one_it_is(self):
         """The wording has to match the behaviour, or people rename nothing."""
-        info = self.identity.describe(self.base)
-        first, _ = self.gate._session_prompt(info, "agent-shreyaas", "kbjz3w4a", {})
-        self.assertIn("FIRST run", first)
-        self.assertIn("YOUR ADDRESS", first)
+        prompt, schema = self.gate._session_prompt("agent-shreyaas", "kbjz3w4a", {})
+        self.assertIn("FIRST run", prompt)
+        self.assertIn("YOUR ADDRESS", prompt)
+        # The old two-branch copy is gone: this popup never names a tab, only
+        # the account, so nothing here should still call it "this session's id".
+        self.assertNotIn("THIS SESSION'S", prompt)
+        self.assertNotIn("This session:", prompt)
+        self.assertIn("account", schema["properties"]["name"]["title"].lower())
+        # Declining must not promise a fallback id — it adopts nothing at all.
+        self.assertIn("no address", prompt.lower())
 
     def test_set_identity_publishes_under_the_new_name(self):
         """A rename has to claim the new alias, not wait for the next check_inbox.
@@ -182,6 +189,64 @@ class SessionAdoptionTests(SessionRenameTest):
         self.assertEqual(
             identity._read_json(identity._global_path())["session_counter"], 1
         )
+
+    def test_accepting_the_first_run_prompt_derives_this_session_id(self):
+        """The task's headline behaviour: accepting names the account, and this
+        tab's own address comes out numbered, not equal to the bare account."""
+        identity.save_fingerprint("kbjz3w4a")
+        # Stand in for real key generation. Restored on cleanup -- leaving the
+        # real ensure_keys() replaced would stop every later test in this run
+        # from caching a real fingerprint for ITS OWN home directory.
+        self.addCleanup(setattr, self.gate, "ensure_keys", self.gate.ensure_keys)
+        self.gate.ensure_keys = lambda: "kbjz3w4a"
+        self.reply("anish-bot", suggested="agent-shreyaas")
+        self.assertEqual(self.saved(), "anish-bot.kbjz3w4a")
+        self.assertEqual(self.gate.SESSION_AGENT_ID, "anish-bot-1.kbjz3w4a")
+
+    def test_accept_writes_the_account_name_through_the_locked_helper(self):
+        """The gate must not reach into identity's private read/write helpers --
+        set_account_name is what takes the lock protecting session_counter."""
+        calls = []
+        # Restored on cleanup -- identity is a shared module, and every other
+        # test needs the REAL set_account_name to persist to disk.
+        self.addCleanup(
+            setattr, self.identity, "set_account_name", self.identity.set_account_name
+        )
+        self.identity.set_account_name = lambda name: calls.append(name) or name
+        self.reply("anish-bot", suggested="agent-shreyaas")
+        self.assertEqual(calls, ["anish-bot"])
+
+    def test_env_pinned_session_does_not_derive_or_register(self):
+        """current_agent_id() checks $AGENT_ID first, so that is already this
+        session's address. Deriving and registering a different one would
+        advertise an address the session never actually answers on."""
+        with _env(AGENT_ID="pinned.e5ox72jb"):
+            self.gate.schedule_identity_setup()
+        self.assertEqual(identity.session_records(), {})
+        self.assertIsNone(self.gate.SESSION_AGENT_ID)
+
+    def test_the_no_prompt_path_does_not_block_on_publishing(self):
+        """This branch runs on the main read loop on every later launch; a
+        stalled relay must not delay MCP initialization by a publish call."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        identity.mark_confirmed(self.home)
+
+        started = threading.Event()
+        finish = threading.Event()
+
+        def slow_publish():
+            started.set()
+            finish.wait(timeout=2)
+
+        self.gate._publish_identities = slow_publish
+        self.gate.schedule_identity_setup()
+
+        self.assertTrue(started.wait(timeout=1), "publish should still run")
+        self.assertIsNotNone(
+            self.gate.SESSION_AGENT_ID, "adoption must not wait on publish"
+        )
+        finish.set()
 
 
 class DeclineTest(unittest.TestCase):
