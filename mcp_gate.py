@@ -675,8 +675,8 @@ def offer_identity_setup():
     _startup_fingerprint = identity.saved_fingerprint() or ensure_keys()
     info = identity.describe(base_dir)
     peers = identity.live_sessions()
-    _startup_suggested = identity.suggest_session_name(
-        identity.agent_name(info["agent_id"])
+    _startup_suggested = identity.account_name() or identity.agent_name(
+        info["agent_id"]
     )
     prompt, schema = _session_prompt(
         info, _startup_suggested, _startup_fingerprint, peers

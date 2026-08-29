@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -424,14 +425,6 @@ class FingerprintCacheTests(IsolatedIdentityTest):
 
         self.assertEqual(identity.saved_fingerprint(), "27uumo4l")
 
-    def test_suggestion_qualifies_a_legacy_id_from_the_cache(self):
-        identity.save_fingerprint("27uumo4l")
-        identity.set_agent_id(self.project, "agent-legacy")
-
-        self.assertEqual(
-            identity.suggest_session_id("agent-legacy"), "agent-legacy.27uumo4l"
-        )
-
 
 class SessionRegistryTests(IsolatedIdentityTest):
     """Per-session ids: each tab registers so the next one is offered a free name."""
@@ -471,34 +464,6 @@ class SessionRegistryTests(IsolatedIdentityTest):
                 f.write(body)
 
         identity.live_sessions()
-
-    def test_suggestion_is_the_base_when_nothing_is_running(self):
-        self.assertEqual(
-            identity.suggest_session_id("agent-shreyaas"), "agent-shreyaas"
-        )
-
-    def test_suggestion_avoids_live_ids(self):
-        identity.register_session("agent-shreyaas")
-
-        self.assertEqual(
-            identity.suggest_session_id("agent-shreyaas"), "agent-shreyaas-2"
-        )
-
-    def test_suggestion_walks_past_several_live_ids(self):
-        identity.register_session("agent-shreyaas")
-        self._fake_session(os.getppid(), "agent-shreyaas-2")
-
-        self.assertEqual(
-            identity.suggest_session_id("agent-shreyaas"), "agent-shreyaas-3"
-        )
-
-    def test_suggestion_stays_legal_for_a_long_base(self):
-        base = "a" * 63
-        identity.register_session(base)
-
-        suggested = identity.suggest_session_id(base)
-
-        self.assertIsNotNone(identity.normalize_agent_id(suggested), suggested)
 
     def test_live_sessions_is_empty_when_the_dir_is_missing(self):
         self.assertEqual(identity.live_sessions(), {})
@@ -793,6 +758,45 @@ class AccountNameTests(IsolatedIdentityTest):
 
     def test_account_name_is_none_when_nothing_is_saved(self):
         self.assertIsNone(identity.account_name())
+
+
+class SessionAgentIdTests(IsolatedIdentityTest):
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def test_session_id_is_account_plus_ordinal(self):
+        self.assertEqual(
+            identity.session_agent_id(3), "anish-bot-3.e5ox72jb"
+        )
+
+    def test_session_id_uses_a_hyphen_not_a_dot(self):
+        self.assertNotIn(".1.", identity.session_agent_id(1))
+
+    def test_session_id_round_trips(self):
+        sid = identity.session_agent_id(3)
+        name, fp = identity.split_agent_id(sid)
+        self.assertEqual(name, "anish-bot-3")
+        self.assertEqual(fp, "e5ox72jb")
+        self.assertEqual(identity.compose_agent_id(name, fp), sid)
+
+    def test_session_id_matches_the_relay_grammar(self):
+        relay = re.compile(
+            r"^[a-z0-9][a-z0-9_-]{0,31}[a-z0-9]\.([a-z2-7]{8}|[a-z2-7]{16})$"
+        )
+        self.assertTrue(relay.match(identity.session_agent_id(12)))
+
+    def test_a_long_account_name_is_truncated_to_fit(self):
+        stem = "a" * 33
+        fitted = identity.fit_session_name(stem, 100)
+        self.assertLessEqual(len(fitted), 33)
+        self.assertTrue(fitted.endswith("-100"))
+        self.assertIsNotNone(identity.normalize_name(fitted))
+
+    def test_session_id_is_none_without_an_account_name(self):
+        os.unlink(identity._global_path())
+        self.assertIsNone(identity.session_agent_id(1))
 
 
 class OrdinalCounterTests(IsolatedIdentityTest):

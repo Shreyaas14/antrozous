@@ -238,32 +238,26 @@ def unregister_session():
         pass
 
 
-def suggest_session_name(base):
-    """base if no live session uses that name, else base-2, base-3, …
+def fit_session_name(stem, ordinal):
+    """'<stem>-<ordinal>', trimmed so it still satisfies NAME_RE (2-33 chars).
 
-    Tabs on one machine share a fingerprint, so distinctness between them has to
-    come from the name.
+    The stem gives way, never the ordinal: a truncated ordinal could collide with
+    another session, and a collision merges two inboxes.
     """
-    base = normalize_name(base) or "agent"
-    taken = {agent_name(a) for a in live_sessions().values()}
-    if base not in taken:
-        return base
-    for n in range(2, 100):
-        candidate = normalize_name("%s-%d" % (base, n))
-        if candidate and candidate not in taken:
-            return candidate
-    return normalize_name("%s-%s" % (base, secrets.token_hex(2))) or base
+    tail = "-%d" % ordinal
+    stem = (normalize_name(stem) or "agent")[: 33 - len(tail)].rstrip("-_")
+    if not stem:
+        stem = "a"
+    return stem + tail
 
 
-def suggest_session_id(base):
-    """A free, fully qualified id derived from `base`.
-
-    Falls back to the cached fingerprint when `base` is an unqualified legacy id, so
-    the suggestion is collision-proof even before the id has been migrated.
-    """
-    name, fp = split_agent_id(base)
-    suggested = suggest_session_name(name)
-    return compose_agent_id(suggested, fp or saved_fingerprint()) or suggested
+def session_agent_id(ordinal, fingerprint=None):
+    """This session's full address, or None when there is no account name yet."""
+    stem = account_name()
+    if not stem:
+        return None
+    fp = fingerprint or saved_fingerprint()
+    return compose_agent_id(fit_session_name(stem, ordinal), fp)
 
 
 def account_agent_id(base_dir):

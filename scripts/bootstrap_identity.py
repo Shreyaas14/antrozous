@@ -151,7 +151,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     peers = {p: a for p, a in identity.live_sessions().items()}
-    suggested = identity.suggest_session_id(agent_id)
+    suggested = identity.account_agent_id(identity.find_directory())
     line = (
         "antrozous: choosing this session's Agent ID — a prompt will appear %s "
         "(suggested: %s). No need to type anything; just wait for it."
