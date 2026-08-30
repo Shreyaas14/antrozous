@@ -321,6 +321,12 @@ def register_session(agent_id, primary=False):
         }
     )
     if marker is None:
+        # No marker obtainable right now (platform cannot say, or a transient `ps`
+        # failure). Write none rather than a placeholder: a record with no marker
+        # reads as dead, which costs this session its place in the peer list and
+        # the primary slot until its next register_session(), and that is the
+        # right way to fail. A placeholder that read as live would be the
+        # recycled-pid hole again, reopened by a two-second timeout.
         record.pop(_PID_START_KEY, None)
     else:
         record[_PID_START_KEY] = marker
