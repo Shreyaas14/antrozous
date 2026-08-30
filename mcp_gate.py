@@ -717,10 +717,20 @@ _migration_lock = threading.Lock()
 # answers (a dropped request, a closed popup, a client that only PARTIALLY
 # implements the capability) -- see offer_account_migration's docstring for
 # why this session must become addressable regardless.
+#
+# This has to be long enough for a person to actually read the ~10-line
+# prompt and click Accept, not just long enough for a client to round-trip
+# the request. A reply that arrives after this fires is discarded (see
+# _handle_migration_reply) -- by then _finish_identity_setup() has already
+# taken an ordinal under the old stem, so retroactively applying a late
+# accept would reintroduce the ordinal-reuse hazard this whole feature
+# exists to prevent. The offer simply returns next launch instead. A short
+# timeout here doesn't make that safer, it just makes a slow reader lose the
+# offer, silently, every single time.
 try:
-    MIGRATION_ANSWER_TIMEOUT = float(os.environ.get("ANTROZOUS_MIGRATION_TIMEOUT", "20"))
+    MIGRATION_ANSWER_TIMEOUT = float(os.environ.get("ANTROZOUS_MIGRATION_TIMEOUT", "180"))
 except ValueError:
-    MIGRATION_ANSWER_TIMEOUT = 20.0
+    MIGRATION_ANSWER_TIMEOUT = 180.0
 
 
 def _finish_identity_setup():
@@ -930,9 +940,13 @@ def _session_prompt(suggested_name, fp, peers):
         "NAME YOUR ANTROZOUS ACCOUNT\n\n"
         "This is your FIRST run, so the name below becomes YOUR ADDRESS — the one "
         "you give other people. Accepting %s would save it as %s.\n\n"
-        "It is chosen once. Every session you open after this one is numbered "
-        "from it automatically (%s-1, %s-2, ...) with no further prompts. Use the "
-        "set_identity tool later if you want to change the account name.\n\n"
+        "It is chosen once. Each session you open is numbered from it "
+        "automatically (%s-1, %s-2, ...) with no further prompts — including this "
+        "one, which becomes %s-1. That numbered address, not the bare account "
+        "name, is what shows up as the return address on anything you send from "
+        "this session; %s stays reachable as your public front door regardless. "
+        "Use the set_identity tool later if you want to change the account "
+        "name.\n\n"
         "The %s suffix is a digest of your identity key, so someone else picking "
         "the same name still gets a different address and cannot receive your "
         "messages.%s\n\n"
@@ -943,6 +957,8 @@ def _session_prompt(suggested_name, fp, peers):
         % (
             suggested_name,
             full_id,
+            suggested_name,
+            suggested_name,
             suggested_name,
             suggested_name,
             ("." + fp) if fp else "fingerprint",
@@ -2120,5 +2136,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        # Stale entries are also pruned by live_sessions(), so a hard kill is safe.
+        # Nothing here is ever deleted -- session records persist so a resumed
+        # session finds its own address. A hard kill (no finally block runs) is
+        # still safe: live_sessions() treats a dead pid as not-live regardless
+        # of whether unregister_session() ran to clear it.
         identity.unregister_session()
