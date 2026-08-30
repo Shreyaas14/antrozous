@@ -740,14 +740,33 @@ except ValueError:
 def _finish_identity_setup():
     """Adopt this session's derived id and (re)publish keys.
 
-    The shared tail of schedule_identity_setup's non-first-run branch: run
-    immediately when there is nothing to migrate (or the client cannot be
-    asked), or once a migration decision -- real or defaulted by
-    _migration_timeout -- has been made. Must run AFTER any such decision:
-    resume_or_assign_session_id() must not take an ordinal before
-    apply_account_migration's reseed has run, or it could hand out a number
-    some other queue already uses.
+    The ordering constraint is the RESEED, not the migration decision. An earlier
+    docstring here claimed this "must run AFTER any such decision"; the code never
+    required that -- apply_account_migration() calls
+    identity.seed_counter_from_records() unconditionally, on every branch including
+    accepted=None, so the high-water mark is raised whatever the user answers and
+    whether or not they answer at all. What must not happen is
+    resume_or_assign_session_id() taking an ordinal before that reseed, because it
+    could hand out a number some other queue already uses.
+
+    So schedule_identity_setup() reseeds and calls this BEFORE the migration popup
+    is sent. Waiting for the answer left the session unaddressable for
+    STARTUP_DELAY + MIGRATION_ANSWER_TIMEOUT = 183s, during which current_agent_id()
+    fell through to the ACCOUNT address: whoami handed the antrozous-inbox skill the
+    account ws_url, the skill armed its Monitor there, and it stayed there for the
+    rest of the session once adoption switched to <stem>-N -- so mail to the
+    session's own queue rang nothing. The SessionStart hook tells the model to arm
+    on its first turn, which reliably lands inside that window.
+
+    Adopting first confines the migration to the account stem and to future
+    sessions, which is already exactly what a timeout does today.
+
+    Idempotent: a second call once this session has adopted is a no-op, so the
+    backstop calls left in _handle_migration_reply/_migration_timeout (the paths
+    that must guarantee an address even if nothing else ran) cost nothing.
     """
+    if SESSION_AGENT_ID:
+        return
     chosen = resume_or_assign_session_id()
     if chosen:
         _adopt_session_id(chosen)
@@ -762,18 +781,17 @@ def offer_account_migration():
     other way to get an answer.
 
     When a popup IS sent, it is fire-and-forget (see the comment above
-    MIGRATION_RID): this function returns immediately without adopting
-    anything. Adoption happens later, in whichever of _handle_migration_reply
-    (a real answer arrived) or _migration_timeout (one never did) fires
-    first.
+    MIGRATION_RID): this function returns immediately. It does not adopt
+    anything either way -- schedule_identity_setup() has already reseeded the
+    counter and adopted this session's id before calling here, precisely so the
+    session is addressable while the popup is on screen (see
+    _finish_identity_setup).
     """
     candidate = migration_candidate()
     if not candidate:
-        _finish_identity_setup()
         return
     if not CLIENT_ELICITATION:
         apply_account_migration(accepted=False)
-        _finish_identity_setup()
         return
 
     current_stem = identity.account_name()
@@ -876,6 +894,9 @@ def _handle_migration_reply(m):
         apply_account_migration(accepted=None)
         log("migration prompt %s; will offer again next launch" % action)
 
+    # Backstop only: schedule_identity_setup() adopts before the popup is sent, so
+    # this is a no-op on the real startup path. It stays because "this session ends
+    # up with an address" must not depend on any one caller having run first.
     _finish_identity_setup()
     return True
 
@@ -894,6 +915,7 @@ def _migration_timeout():
         "name and continuing" % MIGRATION_ANSWER_TIMEOUT
     )
     apply_account_migration(accepted=None)
+    # Backstop, as in _handle_migration_reply -- normally already adopted.
     _finish_identity_setup()
 
 
@@ -906,6 +928,16 @@ def schedule_identity_setup():
         # burn an ordinal every launch for an id nothing ever uses.
         return
     if not needs_account_setup():
+        # Adopt this session's own id NOW -- before the migration popup is even
+        # scheduled, let alone answered. Everything the ordinal depends on is
+        # already known: the reseed below is what apply_account_migration() runs
+        # unconditionally on every branch anyway, so it does not depend on the
+        # user's answer. Deferring adoption behind the popup left this session
+        # answering as the ACCOUNT address for STARTUP_DELAY +
+        # MIGRATION_ANSWER_TIMEOUT = 183s, long enough for the antrozous-inbox
+        # skill to arm its Monitor on the wrong socket for the rest of the session.
+        identity.seed_counter_from_records()
+        _finish_identity_setup()
         if migration_candidate() and CLIENT_ELICITATION and STARTUP_DELAY > 0:
             # A migration popup is elicitation too, sent from this same
             # notifications/initialized handler -- deferred for the same

@@ -1006,14 +1006,21 @@ class MigrationTests(SessionRenameFixture):
         self.gate.schedule_identity_setup()
 
         self.assertEqual(sent, [], "must not send before the delay elapses")
-        self.assertIsNone(self.gate.SESSION_AGENT_ID, "must not adopt before deciding")
+        self.assertIsNotNone(
+            self.gate.SESSION_AGENT_ID,
+            "the session must be addressable while the popup is still pending",
+        )
 
     def test_schedule_identity_setup_seeds_before_taking_an_ordinal(self):
-        """Regression for the ordering this whole task exists to guarantee:
-        the migration decision (and its reseed) must land BEFORE
-        resume_or_assign_session_id() takes this session's own ordinal, or a
-        freshly-migrated stem could hand out a number that already has a
-        live queue on the relay under the OLD stem's numbering."""
+        """Regression for the ordering this whole task exists to guarantee: the
+        RESEED must land before resume_or_assign_session_id() takes this session's
+        own ordinal, or the session could be handed a number that already has a
+        live queue on the relay.
+
+        The reseed is the constraint, not the user's answer -- so it now runs, and
+        the session adopts, before the popup is sent (see _finish_identity_setup).
+        Here the sessions directory already holds anish-bot-1-3, so the ordinal
+        this session takes must be 4, not 1."""
         identity.save_fingerprint("e5ox72jb")
         identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
         identity.mark_confirmed(self.home)
@@ -1040,14 +1047,56 @@ class MigrationTests(SessionRenameFixture):
 
         self.assertEqual(len(sent), 1)
         self.assertTrue(self.gate._migration_pending)
-        self.assertIsNone(self.gate.SESSION_AGENT_ID, "not adopted until answered")
+        self.assertEqual(
+            self.gate.SESSION_AGENT_ID,
+            "anish-bot-1-4.e5ox72jb",
+            "adopted before the popup, with the reseeded ordinal",
+        )
 
         self.gate._handle_migration_reply(
             {"id": sent[0]["id"], "result": {"action": "accept", "content": {}}}
         )
 
+        # The migration is confined to the ACCOUNT stem and to future sessions --
+        # exactly what a timeout already did -- so this session keeps the id it
+        # adopted rather than being renamed underneath itself.
         self.assertEqual(identity.account_name(), "anish-bot")
-        self.assertEqual(self.gate.SESSION_AGENT_ID, "anish-bot-4.e5ox72jb")
+        self.assertEqual(self.gate.SESSION_AGENT_ID, "anish-bot-1-4.e5ox72jb")
+
+    def test_the_session_is_addressable_while_the_popup_is_pending(self):
+        """The defect this closes. current_agent_id() used to fall through to the
+        ACCOUNT address for STARTUP_DELAY + MIGRATION_ANSWER_TIMEOUT = 183s, so a
+        whoami inside the window handed the antrozous-inbox skill the account
+        ws_url; the skill armed its Monitor there and stayed there for the rest of
+        the session once adoption finally switched to <stem>-N. The SessionStart
+        hook asks the model to arm on its first turn, which lands inside it."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        identity.mark_confirmed(self.home)
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        self.addCleanup(setattr, self.gate, "STARTUP_DELAY", self.gate.STARTUP_DELAY)
+        self.gate.STARTUP_DELAY = 0
+        sent = []
+        self.addCleanup(setattr, self.gate, "send", self.gate.send)
+        self.gate.send = lambda obj: sent.append(obj)
+        self.addCleanup(self._force_resolve_migration)
+
+        with _env(CLAUDE_CODE_SESSION_ID="sess-new"):
+            self.gate.schedule_identity_setup()
+
+            self.assertTrue(self.gate._migration_pending, "popup still unanswered")
+            session = self.gate.current_agent_id()
+            self.assertNotEqual(
+                session,
+                self.gate.account_agent_id(),
+                "a pending popup must not leave this session answering as the "
+                "account's front door",
+            )
+            self.assertEqual(session, "anish-bot-1-1.e5ox72jb")
+            self.assertIn(session, self.gate.inbox_addresses())
 
 
 class MigrationOfferDoesNotBlockTheReadLoopTest(unittest.TestCase):
