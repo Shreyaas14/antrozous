@@ -1005,6 +1005,73 @@ class SessionAgentIdTests(IsolatedIdentityTest):
         self.assertIsNone(identity.session_agent_id(1))
 
 
+class SessionStemTierTests(IsolatedIdentityTest):
+    """A directory that opted out must send from ITS name, not the account's.
+
+    Regression. session_agent_id() derived the stem from account_name(), which reads
+    the GLOBAL record only, while account_agent_id() honours the project tier -- so
+    in a directory with .antrozous/identity.json the front door was the project id
+    but every outbound from_agent carried the global account's stem. Before the
+    session redesign the stem came from the winning tier and this could not happen;
+    README still promises "A directory can opt out and be its own agent".
+    """
+
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        identity.set_account_name("anish-bot")
+        identity.set_agent_id(self.project, "agent-foo-ab12.e5ox72jb", scope="project")
+
+    def test_project_override_supplies_the_stem(self):
+        self.assertEqual(identity.session_stem(self.project), "agent-foo-ab12")
+
+    def test_session_id_is_built_from_the_project_name(self):
+        self.assertEqual(
+            identity.session_agent_id(1, base_dir=self.project),
+            "agent-foo-ab12-1.e5ox72jb",
+        )
+
+    def test_the_session_id_and_the_front_door_agree_on_the_stem(self):
+        """The pair that disagreed: account_agent_id() already honoured the project
+        tier, so the two addresses named two different agents."""
+        front_door = identity.account_agent_id(self.project)
+        session = identity.session_agent_id(1, base_dir=self.project)
+        self.assertEqual(
+            identity.agent_name(front_door),
+            identity.agent_name(session).rsplit("-", 1)[0],
+        )
+
+    def test_find_directory_is_used_when_no_base_dir_is_given(self):
+        with _env(CLAUDE_PROJECT_DIR=self.project):
+            self.assertEqual(
+                identity.session_agent_id(2), "agent-foo-ab12-2.e5ox72jb"
+            )
+
+    def test_a_directory_without_an_override_still_uses_the_account(self):
+        plain = os.path.join(self._tmp.name, "plain")
+        os.makedirs(plain)
+        self.assertEqual(identity.session_agent_id(1, base_dir=plain),
+                         "anish-bot-1.e5ox72jb")
+
+    def test_an_env_pinned_id_wins_over_both(self):
+        with _env(AGENT_ID="pinned.e5ox72jb"):
+            self.assertEqual(
+                identity.session_agent_id(1, base_dir=self.project),
+                "pinned-1.e5ox72jb",
+            )
+
+    def test_asking_for_the_stem_does_not_create_a_global_record(self):
+        """session_stem() must not inherit resolve_agent_id()'s generate step: a
+        read that invents an account would make 'no account yet' unobservable and
+        silently name the user."""
+        os.unlink(identity._global_path())
+        plain = os.path.join(self._tmp.name, "plain2")
+        os.makedirs(plain)
+        self.assertIsNone(identity.session_stem(plain))
+        self.assertFalse(os.path.exists(identity._global_path()))
+
+
 class OrdinalCounterTests(IsolatedIdentityTest):
     def setUp(self):
         super().setUp()

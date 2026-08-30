@@ -668,6 +668,47 @@ class SetIdentityAccountTests(SessionRenameFixture):
         self.assertIn("whichever session already answers to that address", prompt)
 
 
+class ProjectOverrideSessionTests(SessionRenameFixture):
+    """A directory that opted out of the account must also SEND as itself.
+
+    Regression: resume_or_assign_session_id() built the session id from
+    identity.account_name(), which reads the global record only, while
+    account_agent_id() honours the project tier -- so in a directory with
+    .antrozous/identity.json the front door was the project id and every outbound
+    from_agent carried the GLOBAL account's stem. Nothing covered session
+    derivation under a project override.
+    """
+
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        identity.set_account_name("anish-bot")
+        identity.set_agent_id(self.base, "agent-foo-ab12.e5ox72jb", scope="project")
+
+    def test_session_id_is_numbered_from_the_project_name(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-proj"):
+            chosen = self.gate.resume_or_assign_session_id()
+        self.assertEqual(chosen, "agent-foo-ab12-1.e5ox72jb")
+
+    def test_the_return_address_matches_the_front_door(self):
+        """The user-visible defect: the address people reply to and the address the
+        mail comes from named two different agents."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-proj"):
+            chosen = self.gate.resume_or_assign_session_id()
+        self.assertEqual(self.gate.account_agent_id(), "agent-foo-ab12.e5ox72jb")
+        self.assertTrue(
+            chosen.startswith("agent-foo-ab12-"),
+            "session id %r must be built from the project stem" % (chosen,),
+        )
+
+    def test_the_registered_record_carries_the_project_stem(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-proj"):
+            self.gate.resume_or_assign_session_id()
+            record = identity.session_records()["sess-proj"]
+        self.assertEqual(record["agent_id"], "agent-foo-ab12-1.e5ox72jb")
+
+
 class MigrationTests(SessionRenameFixture):
     """Existing installs may have an account name that already ends in an
     ordinal (the author's own machine has anish-bot-1.e5ox72jb) -- a session

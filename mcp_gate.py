@@ -615,7 +615,11 @@ def resume_or_assign_session_id():
     existing = identity.session_records().get(identity.current_session_key())
     if existing and existing.get("agent_id"):
         return existing["agent_id"]
-    if not identity.account_name():
+    # session_stem(), not account_name(): a directory with .antrozous/identity.json
+    # is its own agent, and its sessions must be numbered from ITS name so the
+    # from_agent on their outbound mail is an address that directory owns. Asking
+    # account_name() here sent them out under the GLOBAL account's stem.
+    if not identity.session_stem():
         return None
     new_id = identity.session_agent_id(identity.next_ordinal())
     if new_id:

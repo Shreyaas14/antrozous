@@ -403,12 +403,62 @@ def fit_session_name(stem, ordinal):
     return stem + tail
 
 
-def session_agent_id(ordinal, fingerprint=None):
-    """This session's full address, or None when there is no account name yet."""
-    stem = account_name()
+def _session_stem_and_fingerprint(base_dir=None):
+    """(stem, fingerprint) from the tier that actually WINS in this directory.
+
+    Mirrors resolve_agent_id()/describe()'s precedence -- $AGENT_ID, then the
+    project file, then the global account -- but WITHOUT resolve_agent_id's final
+    generate step: asking what this directory's stem is must not create a global
+    record as a side effect, and "no stem yet" is a real answer the callers act on.
+
+    The fingerprint comes back alongside the name because a project id carries its
+    own qualified form; it is the same device fingerprint in practice (it is a
+    digest of the device key), but taking it from the winning id rather than the
+    global cache means a project file written before the global one was ever
+    fingerprinted still composes a qualified session id. None means "the tier did
+    not carry one" -- session_agent_id falls back to saved_fingerprint().
+    """
+    base = find_directory() if base_dir is None else base_dir
+    env = os.environ.get("AGENT_ID", "").strip()
+    if env:
+        name, fp = split_agent_id(env)
+        return normalize_name(name), fp
+    project = _read_json(_identity_path(base)) or {}
+    if project.get("agent_id"):
+        name, fp = split_agent_id(project["agent_id"])
+        return normalize_name(name), fp
+    # account_name() is exactly the global tier: the explicit account_name field,
+    # else the name part of the saved global agent_id, else None.
+    return account_name(), None
+
+
+def session_stem(base_dir=None):
+    """The name THIS directory's session ids are built from, or None.
+
+    Deliberately NOT account_name(). account_name() is the GLOBAL stem and stays
+    that way -- it backs the first-run prompt and the legacy-ordinal migration,
+    both of which are device-wide decisions. But a directory carrying
+    .antrozous/identity.json has opted out of that account on purpose, and its
+    sessions have to send from ITS name: deriving the stem from account_name()
+    unconditionally put the global account's name on the outbound from_agent of a
+    directory the user isolated, which is the opposite of what the override is for
+    (README: "A directory can opt out and be its own agent").
+
+    Before the session redesign the stem came from
+    identity.agent_name(describe()["agent_id"]) and honoured the winning tier;
+    this restores that, scoped to session derivation so account_name()'s other
+    callers -- migration_candidate(), needs_account_setup() -- keep asking the
+    device-wide question they mean to ask.
+    """
+    return _session_stem_and_fingerprint(base_dir)[0]
+
+
+def session_agent_id(ordinal, fingerprint=None, base_dir=None):
+    """This session's full address, or None when this directory has no stem yet."""
+    stem, tier_fingerprint = _session_stem_and_fingerprint(base_dir)
     if not stem:
         return None
-    fp = fingerprint or saved_fingerprint()
+    fp = fingerprint or tier_fingerprint or saved_fingerprint()
     return compose_agent_id(fit_session_name(stem, ordinal), fp)
 
 
