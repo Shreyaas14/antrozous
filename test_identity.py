@@ -587,8 +587,19 @@ class PrimarySessionTests(IsolatedIdentityTest):
     """Exactly one session drains account mail, and the slot is self-healing."""
 
     def _fake_session(self, pid, agent_id, primary=False):
+        """A record for `pid`, stamped so a LIVE pid reads as genuinely live.
+
+        Liveness is the pid plus its process-start marker, so a record for a
+        running process has to carry that pid's real marker -- without it the
+        record models a stale leftover, not another live session, and every
+        "another session already holds the slot" test would be asserting against
+        the wrong scenario.
+        """
         os.makedirs(identity.sessions_dir(), exist_ok=True)
         record = {"agent_id": agent_id, "pid": pid}
+        marker = identity.pid_start_marker(pid)
+        if marker is not None:
+            record[identity._PID_START_KEY] = marker
         if primary:
             record["primary"] = True
         with open(os.path.join(identity.sessions_dir(), "%d.json" % pid), "w") as f:
@@ -682,6 +693,154 @@ class PrimarySessionTests(IsolatedIdentityTest):
             if rec.get("primary")
         ]
         self.assertEqual(len(live_primaries), 1)
+
+
+class PidGenerationTests(IsolatedIdentityTest):
+    """A recycled pid must not resurrect a dead session's record.
+
+    Records are never pruned, so a SIGKILLed session's {"pid": N, "primary": true}
+    survives indefinitely. Once the OS hands pid N to an unrelated process a bare
+    _pid_alive(N) reports it live, claim_primary() refuses forever, nothing drains
+    the account address and whoami reports a phantom session. Liveness therefore
+    checks the pid's GENERATION -- its process start time -- not just the number.
+    """
+
+    def _write(self, key, record):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "%s.json" % key), "w") as f:
+            json.dump(record, f)
+
+    def setUp(self):
+        super().setUp()
+        if identity.pid_start_marker() is None:
+            self.skipTest("no process-start marker available on this platform")
+
+    def test_marker_is_stamped_on_registration(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            record = identity.session_records()["sess-one"]
+        self.assertEqual(
+            record[identity._PID_START_KEY], identity.pid_start_marker(os.getpid())
+        )
+
+    def test_a_recycled_pid_does_not_make_a_dead_record_live(self):
+        """The whole point: this process IS alive and IS the recorded pid, but it
+        is a different generation of it than the one that wrote the record."""
+        self._write(
+            "ghost",
+            {
+                "agent_id": "ghost.aaaaaaaa",
+                "pid": os.getpid(),
+                identity._PID_START_KEY: "not-this-generation",
+            },
+        )
+        self.assertNotIn("ghost", identity.live_session_records())
+        self.assertNotIn(os.getpid(), identity.live_sessions())
+
+    def test_a_record_with_no_marker_is_dead_even_on_a_live_pid(self):
+        """Records predating the marker cannot be authenticated after the fact, and
+        the two errors are not symmetric: a false 'alive' wedges the front door
+        permanently, a false 'dead' costs one briefly double-claimed slot and
+        self-corrects at the next register_session()."""
+        self._write("legacy", {"agent_id": "legacy.aaaaaaaa", "pid": os.getpid()})
+        self.assertNotIn("legacy", identity.live_session_records())
+
+    def test_the_record_itself_still_resolves(self):
+        """Liveness changed; identity did not. A resumed session must still find
+        its own address in a record the liveness check rejects."""
+        self._write(
+            "ghost",
+            {
+                "agent_id": "ghost.aaaaaaaa",
+                "pid": os.getpid(),
+                identity._PID_START_KEY: "not-this-generation",
+            },
+        )
+        self.assertEqual(
+            identity.session_records()["ghost"]["agent_id"], "ghost.aaaaaaaa"
+        )
+
+    def test_a_wedged_primary_slot_is_reclaimable(self):
+        """The reported defect end to end: a hard-killed primary whose pid has been
+        recycled must not hold the front door shut.
+
+        The recycled pid is os.getppid(), not os.getpid(): an UNRELATED live
+        process is what recycling actually produces, and it is the only version of
+        the scenario that reaches claim_primary()'s refusal branch -- with this
+        process's own pid in the record, claim_primary() short-circuits on
+        "holder == os.getpid()" and returns True even unfixed.
+        """
+        self._write(
+            "ghost",
+            {
+                "agent_id": "ghost.aaaaaaaa",
+                "pid": os.getppid(),
+                identity._PID_START_KEY: "not-this-generation",
+                "primary": True,
+            },
+        )
+        with _env(CLAUDE_CODE_SESSION_ID="sess-live"):
+            identity.register_session("live.aaaaaaaa")
+            self.assertTrue(identity.claim_primary())
+            self.assertTrue(identity.is_primary())
+
+    def test_a_live_holder_with_a_matching_marker_still_keeps_the_slot(self):
+        """The other half: the marker must not make every holder look dead."""
+        self._write(
+            "other",
+            {
+                "agent_id": "other.aaaaaaaa",
+                "pid": os.getppid(),
+                identity._PID_START_KEY: identity.pid_start_marker(os.getppid()),
+                "primary": True,
+            },
+        )
+        with _env(CLAUDE_CODE_SESSION_ID="sess-live"):
+            identity.register_session("live.aaaaaaaa")
+            self.assertFalse(identity.claim_primary())
+
+    def test_unregister_drops_the_marker_with_the_pid(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            identity.unregister_session()
+            record = identity.session_records()["sess-one"]
+        self.assertNotIn(identity._PID_START_KEY, record)
+
+    def test_a_platform_that_cannot_report_start_times_degrades_to_the_pid(self):
+        """A platform with no answer must fall back to the pre-marker behaviour, not
+        declare every running session dead."""
+        self._write("legacy", {"agent_id": "legacy.aaaaaaaa", "pid": os.getpid()})
+        self.addCleanup(
+            setattr, identity, "_pid_start_times", identity._pid_start_times
+        )
+        identity._pid_start_times = lambda pids: None
+        self.assertIn("legacy", identity.live_session_records())
+
+    def test_an_empty_answer_is_not_the_same_as_no_answer(self):
+        """{} means 'asked, and none of those pids exist'; None means 'cannot ask'.
+        Collapsing them would resurrect the bug on any platform that answers."""
+        self._write("legacy", {"agent_id": "legacy.aaaaaaaa", "pid": os.getpid()})
+        self.addCleanup(
+            setattr, identity, "_pid_start_times", identity._pid_start_times
+        )
+        identity._pid_start_times = lambda pids: {}
+        self.assertNotIn("legacy", identity.live_session_records())
+
+    def test_a_resumed_session_on_a_recycled_pid_gets_no_stale_primary(self):
+        """register_session()'s carry-forward is pid AND generation: landing on the
+        same pid number as a dead primary must not inherit its flag."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            self._write(
+                "sess-one",
+                {
+                    "agent_id": "bob.aaaaaaaa",
+                    "pid": os.getpid(),
+                    identity._PID_START_KEY: "not-this-generation",
+                    "primary": True,
+                },
+            )
+            identity.register_session("bob.aaaaaaaa")
+            self.assertNotIn("primary", identity.session_records()["sess-one"])
 
 
 class GitExclusionTests(unittest.TestCase):

@@ -108,6 +108,115 @@ def _pid_alive(pid):
     return True
 
 
+# A pid on its own is not an identity. The OS recycles pids, and session records
+# are never pruned (see session_records), so a record left behind by a SIGKILLed,
+# crashed or power-cut session sits on disk until its pid comes round again --
+# at which point _pid_alive() starts reporting an unrelated process as that
+# session. Before records became permanent the exposure was minutes, because every
+# scan unlinked the dead ones; now it is unbounded, and a stale
+# {"pid": N, "primary": true} that reads live wedges the front door: claim_primary()
+# refuses forever, nothing drains the account address, and whoami reports a phantom
+# session. After a reboot every stale pid is a recycling candidate at once.
+#
+# What closes it is a marker for the pid's GENERATION, stored beside the pid and
+# re-derived from the OS at scan time: the holder's process START TIME.
+#
+# Chosen over a boot identifier because it also separates two generations of one
+# pid WITHIN a single boot, and because both sources below are values the kernel
+# records once at fork and never recomputes, so nothing makes them drift under a
+# live holder:
+#   - procfs (Linux, WSL): field 22 of /proc/<pid>/stat, ticks since boot. No
+#     subprocess, no locale, no clock.
+#   - everywhere else: `ps -o lstart=`, the wall clock stamped at fork. Run under
+#     LC_ALL=C so a locale change between the write and the read cannot fake a
+#     mismatch.
+#
+# macOS's obvious boot identifier, `sysctl kern.boottime`, was rejected for the
+# same reason: the kernel moves it whenever the wall clock is stepped, and a marker
+# that changes under a live holder marks every running session dead at once --
+# which costs two sessions both draining the front door, the very isolation
+# inbox_addresses() exists to keep.
+_PID_START_KEY = "pid_start"
+
+# Guard against handing `ps` something it will reject outright: an out-of-range pid
+# makes it fail the WHOLE listing (exit 1, no output), which would read as "every
+# one of these pids is dead". _pid_alive() already filters those out, so this is a
+# second belt on the same trousers.
+_PID_MAX = 1 << 22
+
+
+def _pid_start_from_proc(pid):
+    """Field 22 of /proc/<pid>/stat, or None."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    # comm is parenthesised and may itself contain spaces and ')', so split on the
+    # LAST ')' rather than tokenising from the left. The first field after it is
+    # state (field 3), so field 22 is index 19.
+    fields = data.rpartition(b")")[2].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return fields[19].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def _pid_starts_from_ps(pids):
+    """{pid: 'lstart' string} via one ps call, or None if ps cannot be used."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pid=,lstart=", "-p", ",".join(str(p) for p in sorted(pids))],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    # 0 = at least one matched, 1 = none of them exist any more. Anything else is
+    # ps failing rather than answering, and must NOT be read as "all dead".
+    if result.returncode not in (0, 1):
+        return None
+    out = {}
+    for line in result.stdout.splitlines():
+        head, _, rest = line.strip().partition(" ")
+        if not (head.isdigit() and rest.strip()):
+            continue
+        out[int(head)] = rest.strip()
+    return out
+
+
+def _pid_start_times(pids):
+    """{pid: start-time marker} for `pids`, or None when the platform cannot say.
+
+    None and {} are deliberately different answers. None means "no generation
+    information available here" and callers must fall back to a bare pid check --
+    i.e. to the pre-marker behaviour, because a platform that cannot answer must
+    not have every one of its sessions declared dead. {} means the query worked and
+    none of those pids exist any more.
+    """
+    wanted = {p for p in pids if isinstance(p, int) and 0 < p < _PID_MAX}
+    if not wanted:
+        return {}
+    if os.path.isdir("/proc/%d" % os.getpid()):
+        return {
+            pid: marker
+            for pid, marker in ((p, _pid_start_from_proc(p)) for p in wanted)
+            if marker is not None
+        }
+    return _pid_starts_from_ps(wanted)
+
+
+def pid_start_marker(pid=None):
+    """This process's (or `pid`'s) generation marker, or None if unobtainable."""
+    pid = os.getpid() if pid is None else pid
+    starts = _pid_start_times({pid})
+    return (starts or {}).get(pid)
+
+
 def session_records():
     """{session_key: record} for EVERY record on disk.
 
@@ -136,11 +245,42 @@ def session_records():
 
 
 def live_session_records():
-    """{session_key: record} for records whose process is still running."""
+    """{session_key: record} for records whose process is still running.
+
+    "Still running" is the pid AND its generation marker (see _PID_START_KEY): a
+    recycled pid is a different process, not a resurrected session.
+
+    A record written before the marker existed carries none, and is treated as
+    DEAD. The two errors are not symmetric. A false "alive" is permanent and
+    wedges the front door -- the defect this marker exists to remove -- while a
+    false "dead" costs at most a briefly double-claimed primary slot and
+    self-corrects the moment the session in question next registers, which every
+    session does at startup. Marker-less records therefore come from processes
+    started before this code was installed; those are overwhelmingly already dead,
+    and the one that is not is a session whose gate will re-register with a marker
+    on its next launch. A one-time migration was rejected because there is nothing
+    to migrate them WITH: no marker can be invented after the fact for a pid whose
+    generation nobody recorded.
+
+    Identity is unaffected: session_records() still returns every record, so a
+    resumed session finds its own address regardless of what liveness says.
+    """
+    records = session_records()
+    candidates = {
+        key: rec
+        for key, rec in records.items()
+        if isinstance(rec.get("pid"), int) and _pid_alive(rec["pid"])
+    }
+    starts = _pid_start_times({rec["pid"] for rec in candidates.values()})
+    if starts is None:
+        # Platform cannot report process start times. Degrade to the bare pid
+        # check rather than declaring every session dead.
+        return candidates
     return {
         key: rec
-        for key, rec in session_records().items()
-        if isinstance(rec.get("pid"), int) and _pid_alive(rec["pid"])
+        for key, rec in candidates.items()
+        if rec.get(_PID_START_KEY) is not None
+        and rec.get(_PID_START_KEY) == starts.get(rec["pid"])
     }
 
 
@@ -163,7 +303,14 @@ def register_session(agent_id, primary=False):
     # caller. Without this, a SIGKILLed primary's record (never pruned) can hand
     # its flag to a resumed session while a second session already claimed the
     # vacant slot, leaving two live primaries at once.
-    was_primary = bool(record.get("primary")) and record.get("pid") == os.getpid()
+    marker = pid_start_marker()
+    was_primary = (
+        bool(record.get("primary"))
+        and record.get("pid") == os.getpid()
+        # Same pid is not the same process once pids recycle, so the flag only
+        # carries forward when the generation matches too.
+        and record.get(_PID_START_KEY) == marker
+    )
     record.update(
         {
             "claude_session_id": current_session_key(),
@@ -173,6 +320,10 @@ def register_session(agent_id, primary=False):
             "last_seen_at": str(datetime.now()),
         }
     )
+    if marker is None:
+        record.pop(_PID_START_KEY, None)
+    else:
+        record[_PID_START_KEY] = marker
     if primary or was_primary:
         record["primary"] = True
     else:
@@ -230,6 +381,7 @@ def unregister_session():
     if not record:
         return
     record["pid"] = None
+    record.pop(_PID_START_KEY, None)
     record.pop("primary", None)
     record["last_seen_at"] = str(datetime.now())
     try:
@@ -327,6 +479,14 @@ def _take_flock():
     (some network filesystems), the caller proceeds WITHOUT the lock rather than
     failing. A missing lock must never stop a session from starting; on such a
     platform the race simply remains, which is exactly the pre-lock behavior.
+
+    Known, accepted stall: this runs with _LOCAL_LOCK already held and LOCK_EX has
+    no timeout, so a cross-process holder that is wedged rather than dead blocks
+    every identity write in THIS process, including the ones other threads are
+    waiting on behind _LOCAL_LOCK. The kernel releases flock when a holder exits or
+    is killed, so this needs a live-but-stuck holder to happen at all; a timeout
+    here would trade that for unguarded writes, which is the ordinal-reuse hazard
+    the lock exists to prevent.
     """
     if fcntl is None:
         return None
