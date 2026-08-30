@@ -2,6 +2,8 @@
 
 Status: implemented, 2026-08-30.
 
+Sections 1 and 2 below are preserved as written, in the present tense, and describe the state of the code BEFORE this work. The defects they name (F1-F4 and the ordinal-reuse note) are fixed; read them as the snapshot that motivated the design, not as claims about shipped code.
+
 ## 1. Where we are
 
 An antrozous id is `<name>.<fingerprint>`, where the fingerprint is 8 base32 chars

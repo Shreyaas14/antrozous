@@ -515,8 +515,10 @@ class HookAnnouncementTests(ListenerStateTest):
         payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
         self.assertNotIn("-1.", payload["systemMessage"])
 
-    def test_a_later_run_does_not_announce_a_popup(self):
-        """Task 4 deleted the per-session popup. The hook must stop promising it."""
+    def context_of(self, payload):
+        return (payload.get("hookSpecificOutput") or {}).get("additionalContext", "")
+
+    def _named_account(self):
         identity_json = os.path.join(self.home, "identity.json")
         with open(identity_json, "w") as f:
             json.dump(
@@ -528,12 +530,50 @@ class HookAnnouncementTests(ListenerStateTest):
                 },
                 f,
             )
+
+    def test_a_later_run_does_not_announce_a_popup(self):
+        """Task 4 deleted the per-session popup. The hook must stop promising it."""
+        self._named_account()
         payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
         self.assertNotIn("prompt will appear", payload["systemMessage"])
 
     def test_a_first_run_still_announces_the_popup(self):
         payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
         self.assertIn("prompt will appear", payload["systemMessage"])
+
+    def test_a_later_runs_model_directive_does_not_promise_a_popup(self):
+        """The half that was missed. Branching only the human-visible
+        systemMessage left the MODEL's additionalContext still saying the id "is
+        being chosen by a popup the gate raises at startup" and listing "says no
+        prompt appeared" as a reason to call set_identity -- which from session two
+        onward is the normal state, so the directive actively invited a spurious
+        set_identity call. A wrong instruction here produces wrong agent
+        behaviour, not just a confused reader."""
+        self._named_account()
+        context = self.context_of(
+            self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        )
+        self.assertNotIn("popup the gate raises", context)
+        self.assertNotIn("says no prompt appeared", context)
+        self.assertIn("NO naming popup appears", context)
+        self.assertIn("anish-bot.e5ox72jb", context)
+
+    def test_a_later_runs_model_directive_still_forbids_a_reflex_set_identity(self):
+        """Dropping the popup claim must not drop the instruction it carried."""
+        self._named_account()
+        context = self.context_of(
+            self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        )
+        self.assertIn("Do NOT call", context)
+        self.assertIn("set_identity", context)
+        self.assertIn("whoami", context)
+
+    def test_a_first_runs_model_directive_still_announces_the_popup(self):
+        """The other branch has to keep saying what is true of a FIRST run."""
+        context = self.context_of(
+            self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        )
+        self.assertIn("popup the gate raises", context)
 
 
 class SessionLineDirectTests(ListenerStateTest):
@@ -542,14 +582,18 @@ class SessionLineDirectTests(ListenerStateTest):
     identity.describe() -- pre-existing, unmodified, and unguarded -- reads both
     the project and global identity files unconditionally as the very first
     statement of the hook's __main__. Any corruption severe enough to make
-    account_agent_id() raise ALSO makes describe() raise, which crashes the whole
-    hook subprocess before session_line() is ever reached (verified: the same
-    scenario below, run through the actual hook subprocess, still exits 1 with a
-    traceback out of identity.describe(), unaffected by session_line()'s own
-    fix). That is a separate, broader, pre-existing gap outside this task's
-    scope. What CAN be isolated and proven here is session_line()'s own
-    contract: called directly, it must not raise even when the account_agent_id()
-    call it makes internally does.
+    account_agent_id() raise ALSO makes describe() raise, before session_line() is
+    ever reached.
+
+    This docstring used to add that the same scenario run through the real hook
+    subprocess "still exits 1 with a traceback out of identity.describe()". A later
+    commit added the top-level try/except around the hook's __main__ (see
+    HookTopLevelGuardTests) and that stopped being true two commits after it was
+    written -- verified: the scenario below, run through the hook subprocess, exits
+    0 and emits FALLBACK_ANNOUNCEMENT. The subprocess is therefore covered
+    elsewhere; what is isolated and proven HERE is session_line()'s own contract:
+    called directly, it must not raise even when the account_agent_id() call it
+    makes internally does.
     """
 
     def setUp(self):

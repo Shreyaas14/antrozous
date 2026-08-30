@@ -1,7 +1,16 @@
 # antrozous — message encryption design
 
-Status: proposal, not implemented.
-Decision requested: approve scheme + phasing before code lands.
+Status: HISTORICAL. Written as a proposal before encryption shipped; encryption
+has since landed, so "not implemented" and the "decision requested" below are both
+out of date. Section 1 in particular describes the PRE-encryption state -- "today a
+message is plaintext from end to end" was true when this was written and is not
+true now. The body has deliberately not been rewritten: doing that faithfully needs
+an audit of the crypto implementation as shipped, which no one has done, and a
+half-corrected security document is worse than one that says plainly which era it
+belongs to. Treat the sections below as the design intent, and the code as the
+authority on what was actually built.
+
+Decision requested (at the time): approve scheme + phasing before code lands.
 
 ## 1. Where we are
 

@@ -25,7 +25,14 @@ FALLBACK_ANNOUNCEMENT = (
     "until this is fixed. This is not silent good news; please check."
 )
 
-FALLBACK_DIRECTIVE = (
+# Two directives, because there are two different truths and the model acts on
+# them. The visible systemMessage was branched when the per-session popup was
+# deleted; this, the half the MODEL reads, was not -- so from session two onward it
+# announced a popup that never fires, told the model not to pre-empt a prompt that
+# does not exist, and listed "says no prompt appeared" as a reason to call
+# set_identity, which is now the NORMAL state. A wrong instruction here produces
+# wrong agent behaviour, not just a confused reader.
+FIRST_RUN_DIRECTIVE = (
     "ANTROZOUS: this session's agent id is being chosen by a popup the gate raises "
     "at startup (saved default: %s). Do NOT call set_identity preemptively — that "
     "would show a second, redundant prompt.\n"
@@ -33,6 +40,21 @@ FALLBACK_DIRECTIVE = (
     "appeared, or asks to change the name. Call `whoami` to see the id this session "
     "actually settled on, plus any other live sessions. Never describe the id as "
     "changed unless the tool reports that the user approved it."
+)
+
+SETTLED_DIRECTIVE = (
+    "ANTROZOUS: this account is already named (%s), so this session's agent id is "
+    "derived from it automatically. NO naming popup appears and none is missing.\n"
+    "Do NOT call `set_identity` because no prompt showed up — from the second "
+    "session onward that is the normal state, and `set_identity` renames the "
+    "ACCOUNT (the address other people use), not this session. Call it only when "
+    "the user explicitly asks to change their account name.\n"
+    "Call `whoami` for the id this session actually settled on, its ws_url, and any "
+    "other live sessions: the gate assigns that id after this hook has run, so "
+    "nothing here is the final answer. Never describe the id as changed unless the "
+    "tool reports that the user approved it.\n"
+    "A one-off popup may still offer to shorten a legacy account name. That is the "
+    "user's to answer and needs nothing from you."
 )
 
 AUTOSTART_DIRECTIVE = (
@@ -144,7 +166,10 @@ def session_line():
     """
     try:
         record = identity.session_records().get(identity.current_session_key())
-        account = identity.account_name()
+        # session_stem(), not account_name(): in a directory with its own
+        # .antrozous/identity.json the gate numbers this session from the PROJECT
+        # name, and the front door printed below is already the project address.
+        account = identity.session_stem()
         if record and record.get("agent_id"):
             line = "\n  You are %s" % record["agent_id"]
             if account:
@@ -186,16 +211,19 @@ if __name__ == "__main__":
     try:
         info = identity.describe(identity.find_directory())
         agent_id = info["agent_id"]
-        context = "ANTROZOUS: this session's agent id is %s (source: %s)." % (
-            agent_id,
-            info["source"],
-        )
 
         # Listening is orthogonal to how the id was resolved, so this applies on
         # both the env-pinned path below and the normal one.
         resume_line, resume_context = listener_resume()
 
         if info["source"] == "env":
+            # Built here rather than at the top: the non-env path below has its own
+            # directive and never used this one, so hoisting it only produced a
+            # string that was thrown away on every normal launch.
+            context = "ANTROZOUS: this session's agent id is %s (source: %s)." % (
+                agent_id,
+                info["source"],
+            )
             line = "antrozous: Agent ID %s (from $AGENT_ID)" % agent_id
             if info["shadowed"]:
                 line += (
@@ -207,7 +235,8 @@ if __name__ == "__main__":
 
         peers = {p: a for p, a in identity.live_sessions().items()}
         suggested = identity.account_agent_id(identity.find_directory())
-        if will_prompt(info):
+        prompting = will_prompt(info)
+        if prompting:
             line = (
                 "antrozous: choosing your Agent ID — a prompt will appear %s "
                 "(suggested: %s). No need to type anything; just wait for it."
@@ -217,10 +246,13 @@ if __name__ == "__main__":
             line = "antrozous: ready"
         if peers:
             line += "\n  Already running: %s" % ", ".join(sorted(peers.values()))
-        emit(
-            line + session_line() + resume_line,
-            (FALLBACK_DIRECTIVE % agent_id) + resume_context,
+        # The MODEL's directive branches on the same condition as the visible line.
+        directive = (
+            (FIRST_RUN_DIRECTIVE % agent_id)
+            if prompting
+            else (SETTLED_DIRECTIVE % suggested)
         )
+        emit(line + session_line() + resume_line, directive + resume_context)
     except Exception:
         emit(FALLBACK_ANNOUNCEMENT)
         sys.exit(0)
