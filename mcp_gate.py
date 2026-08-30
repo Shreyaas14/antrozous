@@ -238,6 +238,8 @@ def _elicit(message, schema=None):
             return result.get("action", "cancel"), (result.get("content") or {})
         if _handle_startup_reply(m):
             continue
+        if _handle_migration_reply(m):
+            continue
         if m.get("method") == "ping" and m.get("id") is not None:
             send({"jsonrpc": "2.0", "id": m["id"], "result": {}})
 
@@ -645,48 +647,119 @@ def migration_candidate():
 
 
 def apply_account_migration(accepted):
-    """Record the account stem -- the stripped one if accepted, the current one
-    verbatim if declined -- and ALWAYS seed the ordinal counter, whichever way
-    the answer went.
+    """Record a migration decision when one was actually made, and ALWAYS seed
+    the ordinal counter -- regardless of the decision, and regardless of
+    whether a decision was made at all.
 
-    Recording a name on decline (not just on accept) is what makes the offer
-    not repeat: it gives has_explicit_account_name() something to find next
-    launch. The reseed matters on decline too: earlier sessions may already
-    have taken ordinals under whatever numbering the old, unmigrated stem
-    produced, and those queues exist on the relay whether or not this name
-    ever gets cleaned up.
+    accepted=True  -- record the stripped candidate (an acceptance).
+    accepted=False -- record the CURRENT name verbatim (an explicit decline;
+                       recording it is what stops the offer repeating -- see
+                       migration_candidate()'s has_explicit_account_name()
+                       check -- but only once the write actually lands: if
+                       identity.set_account_name() raises below, nothing is
+                       recorded, so the offer comes back next launch. That
+                       retry-on-failure is intentional: a transient write
+                       failure must not silently and permanently record a
+                       decision nobody confirmed).
+    accepted=None  -- record nothing (the popup was dismissed, cancelled, or
+                       never answered at all -- not a decision, so the offer
+                       returns next launch). The counter is still seeded:
+                       some other session may already have taken ordinals
+                       under the CURRENT stem's numbering, and this session
+                       is about to take its own ordinal next regardless.
 
     Written through identity.set_account_name() rather than a direct read/
     write of the global record: that helper takes the identity lock that also
     guards session_counter, so this cannot race a concurrent next_ordinal()
     and drop its increment -- which would hand the same ordinal, and the same
-    relay queue, to two sessions.
+    relay queue, to two sessions. ValueError/OSError from that write are
+    logged, not raised -- this runs on the startup path, where an unhandled
+    exception would stop a session from becoming usable.
     """
-    name = migration_candidate() if accepted else identity.account_name()
+    name = None
+    if accepted is True:
+        name = migration_candidate()
+    elif accepted is False:
+        name = identity.account_name()
     if name:
         try:
             identity.set_account_name(name)
         except (ValueError, OSError) as e:
-            log("could not record account migration decision (%r): %s" % (name, e))
+            log(
+                "could not record account migration decision (%r): %s -- will "
+                "offer again next launch" % (name, e)
+            )
     identity.seed_counter_from_records()
     return name
 
 
-def offer_account_migration():
-    """Ask, once, whether to strip a legacy session ordinal off the account
-    name. Declines automatically -- rather than asking -- when the client
-    cannot show a popup, since there is no other way to get the user's answer.
+# Elicitation for the migration offer is fire-and-forget, exactly like the
+# first-run popup (STARTUP_RID above) and for the same two reasons:
+#
+# 1. Claude Code discards elicitation that arrives during initialization (see
+#    STARTUP_DELAY's comment) -- this is sent from the same
+#    notifications/initialized handler, so it is just as subject to that.
+# 2. A BLOCKING _elicit() call here would read from the SAME stdin the main
+#    loop reads from. Any other request that arrived while it waited --
+#    tools/list included -- would be silently discarded by _elicit's own read
+#    loop (it only recognizes its own reply, startup-reply messages, and
+#    pings), never answered. If the client had in fact discarded the
+#    elicitation request per point 1, that answer would never come, and the
+#    whole MCP session would look permanently hung -- worse than the offer
+#    simply never firing.
+MIGRATION_RID = "antrozous-migration-offer"
+_migration_pending = False
+_migration_timer = None
+_migration_lock = threading.Lock()
 
-    Called from schedule_identity_setup's non-first-run branch, before
-    resume_or_assign_session_id(): a session must not take an ordinal before
+# How long to wait for an answer before giving up and continuing anyway. Only
+# reached if the client claimed elicitation support but never actually
+# answers (a dropped request, a closed popup, a client that only PARTIALLY
+# implements the capability) -- see offer_account_migration's docstring for
+# why this session must become addressable regardless.
+try:
+    MIGRATION_ANSWER_TIMEOUT = float(os.environ.get("ANTROZOUS_MIGRATION_TIMEOUT", "20"))
+except ValueError:
+    MIGRATION_ANSWER_TIMEOUT = 20.0
+
+
+def _finish_identity_setup():
+    """Adopt this session's derived id and (re)publish keys.
+
+    The shared tail of schedule_identity_setup's non-first-run branch: run
+    immediately when there is nothing to migrate (or the client cannot be
+    asked), or once a migration decision -- real or defaulted by
+    _migration_timeout -- has been made. Must run AFTER any such decision:
+    resume_or_assign_session_id() must not take an ordinal before
     apply_account_migration's reseed has run, or it could hand out a number
     some other queue already uses.
     """
+    chosen = resume_or_assign_session_id()
+    if chosen:
+        _adopt_session_id(chosen)
+        threading.Thread(target=_publish_identities, daemon=True).start()
+
+
+def offer_account_migration():
+    """Ask, once, whether to strip a legacy session ordinal off the account
+    name. A no-op (straight to _finish_identity_setup) when there is nothing
+    to migrate. Declines automatically -- rather than asking, and finishing
+    immediately -- when the client cannot show a popup, since there is no
+    other way to get an answer.
+
+    When a popup IS sent, it is fire-and-forget (see the comment above
+    MIGRATION_RID): this function returns immediately without adopting
+    anything. Adoption happens later, in whichever of _handle_migration_reply
+    (a real answer arrived) or _migration_timeout (one never did) fires
+    first.
+    """
     candidate = migration_candidate()
     if not candidate:
+        _finish_identity_setup()
         return
     if not CLIENT_ELICITATION:
         apply_account_migration(accepted=False)
+        _finish_identity_setup()
         return
 
     current_stem = identity.account_name()
@@ -700,7 +773,7 @@ def offer_account_migration():
     # never literally ends in the ordinal, only the account name does, and
     # conflating the two here is exactly the class of user-facing-text-vs-code
     # mismatch flagged repeatedly elsewhere in this plan.
-    action, _ = _elicit(
+    prompt = (
         "SHORTEN YOUR ANTROZOUS ADDRESS?\n\n"
         "Your address is %s. The account name in it, %s, already ends in "
         "'-%s' -- probably a session number typed into an older prompt, from "
@@ -710,10 +783,12 @@ def offer_account_migration():
         "Accept = your account name becomes %s (address: %s), so sessions "
         "are named %s-<number>.\n"
         "Decline = keep %s exactly as it is.\n\n"
-        "Either way, people who already have %s still reach you: the relay "
+        "Either way, people who already have %s still reach you -- the relay "
         "binds an alias to your key's fingerprint, first claim wins, and an "
-        "alias is never reassigned to a different name -- accepting does not "
-        "move it."
+        "alias is never reassigned to a different name, so accepting does "
+        "not move it. That mail just lands in a separate queue this session "
+        "does not poll by default; check_inbox lists it as an OTHER QUEUE so "
+        "you can go read it."
         % (
             current_address,
             current_stem,
@@ -726,7 +801,86 @@ def offer_account_migration():
             current_stem,
         )
     )
-    apply_account_migration(accepted=action == "accept")
+
+    global _migration_pending, _migration_timer
+    with _migration_lock:
+        _migration_pending = True
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": MIGRATION_RID,
+            "method": "elicitation/create",
+            "params": {"message": prompt, "requestedSchema": _EMPTY_SCHEMA},
+        }
+    )
+    log("offered to shorten account name %s -> %s" % (current_stem, candidate))
+    _migration_timer = threading.Timer(MIGRATION_ANSWER_TIMEOUT, _migration_timeout)
+    _migration_timer.daemon = True
+    _migration_timer.start()
+
+
+def _handle_migration_reply(m):
+    """Apply the migration popup's answer, if this message is it, then finish
+    identity setup. Returns True if this message was consumed.
+
+    Mutually exclusive with _migration_timeout via _migration_lock: whichever
+    of the two fires first consumes _migration_pending (and cancels the
+    other), so identity setup finishes exactly once. A reply that arrives
+    after the timeout already fired is deliberately ignored -- by then no
+    decision was recorded (see _migration_timeout), so the offer already
+    knows to come back next launch, and a stale late answer for THIS session
+    is not retroactively applied.
+
+    Only an explicit "accept" or "decline" counts as a decision. Anything
+    else -- "cancel", a dismissal, an elicitation the client rejects outright
+    with an error -- is treated as no decision at all, exactly like
+    do_set_identity's own decline/dismiss split (see its "It will be offered
+    again next session" branch). Collapsing them, as an earlier version of
+    this function did, meant a client that simply REJECTS this elicitation
+    request would look identical to a user who typed "no" -- permanently and
+    silently recording the un-migrated name as explicit and suppressing the
+    offer forever, with no way to tell "user declined" apart from "client
+    couldn't ask" in the log.
+    """
+    global _migration_pending
+    with _migration_lock:
+        if not _migration_pending or m.get("id") != MIGRATION_RID:
+            return False
+        _migration_pending = False
+    if _migration_timer is not None:
+        _migration_timer.cancel()
+
+    action = "cancel"
+    if "error" not in m:
+        action = (m.get("result") or {}).get("action", "cancel")
+
+    if action == "accept":
+        apply_account_migration(accepted=True)
+    elif action == "decline":
+        apply_account_migration(accepted=False)
+    else:
+        apply_account_migration(accepted=None)
+        log("migration prompt %s; will offer again next launch" % action)
+
+    _finish_identity_setup()
+    return True
+
+
+def _migration_timeout():
+    """Fires if offer_account_migration's popup never gets an answer at all --
+    see its docstring, and the comment above MIGRATION_RID, for why this
+    session must become addressable regardless."""
+    global _migration_pending
+    with _migration_lock:
+        if not _migration_pending:
+            return
+        _migration_pending = False
+    log(
+        "migration prompt got no answer within %.0fs; keeping the current "
+        "name and continuing" % MIGRATION_ANSWER_TIMEOUT
+    )
+    apply_account_migration(accepted=None)
+    _finish_identity_setup()
 
 
 def schedule_identity_setup():
@@ -738,22 +892,22 @@ def schedule_identity_setup():
         # burn an ordinal every launch for an id nothing ever uses.
         return
     if not needs_account_setup():
-        # Offered (and, on acceptance or decline, applied and reseeded) BEFORE
-        # resume_or_assign_session_id() takes this session's own ordinal --
-        # see apply_account_migration's docstring for why the ordering matters.
-        # A no-op on every later launch once migration_candidate() is None,
-        # which is the common case: nothing to offer, nothing seeded here.
-        offer_account_migration()
-        # Nothing left to ask. Adopt the derived id now so the session is
-        # addressable before the user's first turn. This runs on EVERY later
-        # launch, so the adoption itself stays synchronous (cheap, local file
-        # work) but the network publish is handed to a thread -- this is
-        # called straight from the main read loop, and a stalled relay must
-        # not delay tools/list etc.
-        chosen = resume_or_assign_session_id()
-        if chosen:
-            _adopt_session_id(chosen)
-            threading.Thread(target=_publish_identities, daemon=True).start()
+        if migration_candidate() and CLIENT_ELICITATION and STARTUP_DELAY > 0:
+            # A migration popup is elicitation too, sent from this same
+            # notifications/initialized handler -- deferred for the same
+            # reason the first-run popup below is (see STARTUP_DELAY's
+            # comment). Deferred ONLY when there is actually something to
+            # send: the common case (nothing to migrate) stays exactly as
+            # fast as it always was, with no Timer involved at all.
+            t = threading.Timer(STARTUP_DELAY, offer_account_migration)
+            t.daemon = True
+            t.start()
+        else:
+            # Either nothing to offer, the client cannot be asked, or
+            # STARTUP_DELAY<=0 (tests; a deliberately-configured client) --
+            # offer_account_migration() itself is still fire-and-forget when
+            # it does send a popup, so calling it inline here never blocks.
+            offer_account_migration()
         return
     if STARTUP_DELAY <= 0:
         offer_identity_setup()
@@ -1904,6 +2058,8 @@ def main():
             break
         method, _id = msg.get("method"), msg.get("id")
         if _handle_startup_reply(msg):
+            continue
+        if _handle_migration_reply(msg):
             continue
         if method is None:
             # A response, not a request: never answer it with an error.

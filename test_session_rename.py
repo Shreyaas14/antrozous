@@ -10,13 +10,18 @@ anish-bot-1.
 import contextlib
 import json
 import os
+import select
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 
 import identity
+
+GATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_gate.py")
 
 
 @contextlib.contextmanager
@@ -94,6 +99,12 @@ class SessionRenameFixture(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.base, ignore_errors=True)
         os.environ.pop("ANTROZOUS_HOME", None)
+        # setUp sets this to "0" so schedule_identity_setup() doesn't fire during
+        # fixture-only tests; left set, it leaks into every later test's os.environ
+        # -- including a real subprocess env built from it, like
+        # MigrationOfferDoesNotBlockTheReadLoopTest's -- silencing
+        # notifications/initialized there too.
+        os.environ.pop("ANTROZOUS_STARTUP_PROMPT", None)
 
     def reply(self, typed, suggested, peers=None):
         """Drive the startup prompt's answer as if the user typed `typed`."""
@@ -738,75 +749,223 @@ class MigrationTests(SessionRenameFixture):
         self.gate.apply_account_migration(accepted=True)
         self.assertEqual(calls, ["anish-bot"])
 
+    def test_no_decision_records_nothing_but_still_seeds(self):
+        """accepted=None -- a dismissed/cancelled/unanswered popup -- is not a
+        decision: nothing is recorded (the pinned RED check below is what
+        the original brief's collapsed decline/cancel branch would have
+        failed), so the offer returns next launch, but the counter is still
+        raised above every ordinal already in use."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "old.json"), "w") as f:
+            json.dump({"agent_id": "anish-bot-1-3.e5ox72jb", "pid": None}, f)
+
+        self.gate.apply_account_migration(accepted=None)
+
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+        self.assertFalse(identity.has_explicit_account_name())
+        self.assertIsNotNone(self.gate.migration_candidate(), "must be offered again")
+        self.assertEqual(identity.next_ordinal(), 4)
+
     def test_offer_without_elicitation_declines_automatically(self):
         identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
         self.gate.CLIENT_ELICITATION = False
         self.gate.offer_account_migration()
         self.assertEqual(identity.account_name(), "anish-bot-1")
         self.assertIsNone(self.gate.migration_candidate())
 
-    def test_offer_with_elicitation_asks_and_applies_acceptance(self):
-        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
-        self.addCleanup(
-            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
-        )
-        self.gate.CLIENT_ELICITATION = True
-        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
-        self.gate._elicit = lambda message, schema=None: ("accept", {})
-        self.gate.offer_account_migration()
-        self.assertEqual(identity.account_name(), "anish-bot")
-
-    def test_offer_with_elicitation_respects_decline(self):
-        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
-        self.addCleanup(
-            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
-        )
-        self.gate.CLIENT_ELICITATION = True
-        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
-        self.gate._elicit = lambda message, schema=None: ("decline", {})
-        self.gate.offer_account_migration()
-        self.assertEqual(identity.account_name(), "anish-bot-1")
-
     def test_offer_does_nothing_without_a_candidate(self):
-        """A clean name must not even ask -- _elicit must not be called."""
+        """A clean name must not even send an elicitation."""
         identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
         self.addCleanup(
             setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
         )
         self.gate.CLIENT_ELICITATION = True
-        calls = []
-        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
-        self.gate._elicit = lambda *a, **kw: calls.append(1) or ("decline", {})
+        sent = []
+        self.addCleanup(setattr, self.gate, "send", self.gate.send)
+        self.gate.send = lambda obj: sent.append(obj)
         self.gate.offer_account_migration()
-        self.assertEqual(calls, [])
+        self.assertEqual(sent, [])
+
+    def _send_migration_offer(self):
+        """Trigger offer_account_migration() with CLIENT_ELICITATION on,
+        capturing the elicitation/create message it sends via `send()`
+        instead of blocking on it -- the whole point of the fire-and-forget
+        redesign this task required. Returns the captured message. Cleans up
+        `send`, CLIENT_ELICITATION and the answer-timeout Timer automatically.
+        """
+        self.addCleanup(
+            setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
+        )
+        self.gate.CLIENT_ELICITATION = True
+        sent = []
+        self.addCleanup(setattr, self.gate, "send", self.gate.send)
+        self.gate.send = lambda obj: sent.append(obj)
+        self.gate.offer_account_migration()
+        self.assertEqual(len(sent), 1, "must send exactly one elicitation")
+        self.assertEqual(sent[0]["method"], "elicitation/create")
+        # Always resolve the pending offer before the test ends, whether or
+        # not the test itself answers it: a real threading.Timer is running
+        # in the background (offer_account_migration started it), and if it
+        # is left alive past this test it can fire _migration_timeout() on a
+        # LATER test's own unrelated pending offer.
+        self.addCleanup(self._force_resolve_migration)
+        return sent[0]
+
+    def _force_resolve_migration(self):
+        if self.gate._migration_pending:
+            self.gate._migration_timeout()
+        if self.gate._migration_timer is not None:
+            self.gate._migration_timer.cancel()
+
+    def test_offer_with_elicitation_asks_and_applies_acceptance(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        msg = self._send_migration_offer()
+        self.assertTrue(self.gate._migration_pending)
+        self.assertEqual(identity.account_name(), "anish-bot-1", "unresolved so far")
+
+        handled = self.gate._handle_migration_reply(
+            {"id": msg["id"], "result": {"action": "accept", "content": {}}}
+        )
+
+        self.assertTrue(handled)
+        self.assertFalse(self.gate._migration_pending)
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_offer_with_elicitation_respects_explicit_decline(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        msg = self._send_migration_offer()
+
+        self.gate._handle_migration_reply(
+            {"id": msg["id"], "result": {"action": "decline", "content": {}}}
+        )
+
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+        self.assertTrue(identity.has_explicit_account_name())
+        self.assertIsNone(self.gate.migration_candidate(), "must not repeat")
+
+    def test_cancel_is_not_recorded_as_a_decision(self):
+        """Important finding #2: collapsing cancel/dismiss into decline meant
+        a client that simply REJECTS the elicitation request (which is
+        exactly what happens when it discards the request outright) would
+        permanently and silently opt the account out of ever being offered
+        the migration again -- indistinguishable in the record from a user
+        who typed "no". do_set_identity keeps these separate on purpose (see
+        its "It will be offered again next session" branch); this must too.
+        """
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        msg = self._send_migration_offer()
+
+        self.gate._handle_migration_reply(
+            {"id": msg["id"], "result": {"action": "cancel", "content": {}}}
+        )
+
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+        self.assertFalse(
+            identity.has_explicit_account_name(),
+            "a cancel must not be recorded as though the user had decided",
+        )
+        self.assertIsNotNone(self.gate.migration_candidate(), "must be offered again")
+
+    def test_a_client_error_response_is_not_recorded_as_a_decision(self):
+        """The other half of finding #2's compounding scenario: a client
+        that rejects elicitation/create outright sends back an error, not an
+        explicit decline -- same non-decision treatment applies."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        msg = self._send_migration_offer()
+
+        self.gate._handle_migration_reply(
+            {"id": msg["id"], "error": {"code": -32601, "message": "not supported"}}
+        )
+
+        self.assertFalse(identity.has_explicit_account_name())
+        self.assertIsNotNone(self.gate.migration_candidate())
+
+    def test_a_late_reply_after_the_timeout_is_ignored(self):
+        """Whichever of the reply or the timeout fires first wins; the other
+        must not re-apply a second, possibly contradictory, decision."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        msg = self._send_migration_offer()
+
+        self.gate._migration_timeout()
+        self.assertFalse(identity.has_explicit_account_name())
+
+        handled = self.gate._handle_migration_reply(
+            {"id": msg["id"], "result": {"action": "accept", "content": {}}}
+        )
+
+        self.assertFalse(handled, "a reply after the timeout must not be applied")
+        self.assertEqual(identity.account_name(), "anish-bot-1")
+        self.assertFalse(
+            identity.has_explicit_account_name(), "the late accept must not land"
+        )
+
+    def test_timeout_with_no_reply_still_finishes_identity_setup(self):
+        """Non-negotiable requirement: if the popup never gets an answer at
+        all, this session must still become addressable -- a migration that
+        cannot fire is a missed convenience, a session that never gets an id
+        because a popup went unanswered is a much worse bug."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self._send_migration_offer()
+
+        self.gate._migration_timeout()
+
+        self.assertIsNotNone(self.gate.SESSION_AGENT_ID)
+        self.assertFalse(identity.has_explicit_account_name())
+        self.assertIsNotNone(self.gate.migration_candidate())
 
     def test_popup_names_both_addresses_and_says_the_alias_does_not_move(self):
         """Four reviews in this plan found user-facing copy that contradicted
         the code. The truthful claim here: people who already have the old
         (bare) name still reach this account, because the relay binds an
         alias to a fingerprint, first claim wins, and it is never
-        reassigned -- so accepting does not move it anywhere."""
+        reassigned -- so accepting does not move it anywhere. Also checks
+        the understatement a later review caught: that mail is not silently
+        lost, but it does not arrive directly either -- it has to be
+        surfaced via check_inbox's other-queues listing."""
         identity.save_fingerprint("e5ox72jb")
         identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
-        captured = {}
 
-        def fake_elicit(message, schema=None):
-            captured["message"] = message
-            return "decline", {}
+        msg = self._send_migration_offer()
 
+        prompt = msg["params"]["message"]
+        self.assertIn("anish-bot-1.e5ox72jb", prompt)
+        self.assertIn("anish-bot.e5ox72jb", prompt)
+        self.assertIn("first claim wins", prompt)
+        self.assertIn("does not move", prompt.lower())
+        self.assertIn("check_inbox", prompt)
+        self.assertIn("does not poll", prompt.lower())
+
+    def test_schedule_identity_setup_defers_the_offer_behind_startup_delay(self):
+        """The migration popup is elicitation sent from the same
+        notifications/initialized handler as the first-run popup, so it is
+        just as subject to the "discards elicitation received during
+        initialization" client bug STARTUP_DELAY exists for -- it must be
+        deferred behind the SAME Timer, not sent inline."""
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        identity.mark_confirmed(self.home)
         self.addCleanup(
             setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
         )
         self.gate.CLIENT_ELICITATION = True
-        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
-        self.gate._elicit = fake_elicit
-        self.gate.offer_account_migration()
+        self.addCleanup(setattr, self.gate, "STARTUP_DELAY", self.gate.STARTUP_DELAY)
+        # Large enough that it cannot plausibly fire before this whole test
+        # process exits (a daemon Timer thread dies with the interpreter
+        # regardless), so there is no real risk of a stray real elicitation
+        # firing later against already-restored module state.
+        self.gate.STARTUP_DELAY = 3600.0
+        sent = []
+        self.addCleanup(setattr, self.gate, "send", self.gate.send)
+        self.gate.send = lambda obj: sent.append(obj)
 
-        msg = captured["message"]
-        self.assertIn("anish-bot-1.e5ox72jb", msg)
-        self.assertIn("anish-bot.e5ox72jb", msg)
-        self.assertIn("first claim wins", msg)
-        self.assertIn("does not move", msg.lower())
+        self.gate.schedule_identity_setup()
+
+        self.assertEqual(sent, [], "must not send before the delay elapses")
+        self.assertIsNone(self.gate.SESSION_AGENT_ID, "must not adopt before deciding")
 
     def test_schedule_identity_setup_seeds_before_taking_an_ordinal(self):
         """Regression for the ordering this whole task exists to guarantee:
@@ -825,14 +984,161 @@ class MigrationTests(SessionRenameFixture):
             setattr, self.gate, "CLIENT_ELICITATION", self.gate.CLIENT_ELICITATION
         )
         self.gate.CLIENT_ELICITATION = True
-        self.addCleanup(setattr, self.gate, "_elicit", self.gate._elicit)
-        self.gate._elicit = lambda message, schema=None: ("accept", {})
+        # STARTUP_DELAY<=0 keeps schedule_identity_setup's dispatch inline
+        # (see its own "else" branch) rather than behind a real Timer, so
+        # this test stays synchronous and deterministic -- covered
+        # separately by test_schedule_identity_setup_defers_the_offer_....
+        self.addCleanup(setattr, self.gate, "STARTUP_DELAY", self.gate.STARTUP_DELAY)
+        self.gate.STARTUP_DELAY = 0
+        sent = []
+        self.addCleanup(setattr, self.gate, "send", self.gate.send)
+        self.gate.send = lambda obj: sent.append(obj)
 
         with _env(CLAUDE_CODE_SESSION_ID="sess-new"):
             self.gate.schedule_identity_setup()
 
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(self.gate._migration_pending)
+        self.assertIsNone(self.gate.SESSION_AGENT_ID, "not adopted until answered")
+
+        self.gate._handle_migration_reply(
+            {"id": sent[0]["id"], "result": {"action": "accept", "content": {}}}
+        )
+
         self.assertEqual(identity.account_name(), "anish-bot")
         self.assertEqual(self.gate.SESSION_AGENT_ID, "anish-bot-4.e5ox72jb")
+
+
+class MigrationOfferDoesNotBlockTheReadLoopTest(unittest.TestCase):
+    """Regression for the bug none of the direct-call tests above can catch:
+    the migration offer used to call the BLOCKING _elicit(), which reads
+    from the SAME stdin the main read loop reads from. Any other request
+    that arrived while it waited -- tools/list included -- was silently
+    discarded by _elicit's own inner loop (it only recognizes its own reply,
+    startup-reply messages, and pings), never answered.
+
+    Calling offer_account_migration() directly, as every test above does,
+    cannot observe this: it never drives the real read loop those other
+    requests travel through, so nothing in this file's other tests would
+    have failed against the unfixed, blocking version. Only spawning the
+    actual gate process and feeding it real, concurrent JSON-RPC traffic
+    exercises the code path where the bug lived -- this test would hang
+    (bounded by the timeouts below, so it fails rather than truly hanging)
+    against the pre-fix code, and passes against the fire-and-forget fix.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        saved_home = os.environ.get("ANTROZOUS_HOME")
+        os.environ["ANTROZOUS_HOME"] = self.home
+        try:
+            identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+            identity.mark_confirmed(self.home)
+        finally:
+            if saved_home is None:
+                os.environ.pop("ANTROZOUS_HOME", None)
+            else:
+                os.environ["ANTROZOUS_HOME"] = saved_home
+
+        env = dict(os.environ, ANTROZOUS_HOME=self.home)
+        env.pop("AGENT_ID", None)
+        # Fire the offer immediately (no real startup delay) and give this
+        # test itself far longer than it needs to answer, so the ONLY way
+        # the fallback answer-timeout can fire is a genuine regression.
+        env["ANTROZOUS_STARTUP_DELAY"] = "0"
+        env["ANTROZOUS_MIGRATION_TIMEOUT"] = "30"
+        self.proc = subprocess.Popen(
+            [sys.executable, GATE_PATH],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+
+    def tearDown(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _send(self, obj):
+        self.proc.stdin.write(json.dumps(obj) + "\n")
+        self.proc.stdin.flush()
+
+    def _recv(self, timeout):
+        """One JSON-RPC line, or None if none arrives within `timeout`
+        seconds -- bounded so a real regression (the loop hanging) fails
+        this test instead of hanging the whole suite."""
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not r:
+            return None
+        line = self.proc.stdout.readline()
+        return json.loads(line) if line else None
+
+    def test_tools_list_is_answered_while_the_migration_popup_is_pending(self):
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"elicitation": {}},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            }
+        )
+        init_reply = self._recv(timeout=5)
+        self.assertIsNotNone(init_reply, "gate did not answer initialize")
+        self.assertEqual(init_reply["result"]["serverInfo"]["name"], "antrozous-gate")
+
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        # Ask for tools/list immediately, BEFORE the migration popup is
+        # answered. Under the old blocking design this request is consumed
+        # and silently dropped inside offer_account_migration's own _elicit
+        # call -- this test would then time out waiting for it.
+        self._send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+
+        seen_elicit_id = None
+        seen_tools_list = False
+        for _ in range(10):
+            if seen_tools_list and seen_elicit_id is not None:
+                break
+            m = self._recv(timeout=3)
+            if m is None:
+                continue
+            if m.get("method") == "elicitation/create":
+                seen_elicit_id = m["id"]
+            elif m.get("id") == 2:
+                seen_tools_list = True
+                self.assertIn("tools", m.get("result", {}))
+
+        self.assertTrue(
+            seen_tools_list,
+            "tools/list was never answered -- the main read loop is blocked",
+        )
+        self.assertIsNotNone(seen_elicit_id, "the migration popup was never sent")
+
+        # Answer it so the process can exit cleanly rather than idling on
+        # its own answer-timeout Timer.
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": seen_elicit_id,
+                "result": {"action": "decline", "content": {}},
+            }
+        )
 
 
 if __name__ == "__main__":
