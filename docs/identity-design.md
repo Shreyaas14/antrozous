@@ -1,7 +1,6 @@
 # antrozous — identity and session addressing design
 
-Status: proposal, not implemented.
-Decision requested: approve the model + migration before code lands.
+Status: implemented, 2026-08-30.
 
 ## 1. Where we are
 
@@ -286,25 +285,7 @@ The listener work established the pattern: subprocess the hook and the CLI, redi
   `listener.json` now has — unreadable, non-UTF-8, directory-in-place, non-object
   JSON must all degrade rather than raise.
 
-## 13. Verified — resume keeps the session id
-
-**Confirmed 2026-08-28.** Two headless runs against a temp `ANTROZOUS_HOME`, with a
-probe writing `CLAUDE_CODE_SESSION_ID` from inside `mcp_gate.main()`:
-
-```
-pid=44284 session=0837931f-fb4a-4b24-8f9e-ff5942b7a6e7   # claude --plugin-dir . -p
-pid=44470 session=0837931f-fb4a-4b24-8f9e-ff5942b7a6e7   # claude --plugin-dir . --resume <id> -p
-```
-
-Different process, same session id. Both halves hold: the MCP server inherits the
-variable (it is not in `.mcp.json`; the environment passes through), and `--resume`
-preserves it. Section 4 is safe to build.
-
-Note for anyone repeating this: the resume run needs `--plugin-dir` too. Without it
-no plugin loads, no gate starts, and the probe stays silent — which reads exactly
-like a failed check.
-
-## 14. Out of scope
+## 13. Out of scope
 
 - **Project-scope overrides** (`.antrozous/identity.json`, `_ensure_git_excluded`,
   `shadowed`, `drop_project_override`). The largest single concept in `identity.py`

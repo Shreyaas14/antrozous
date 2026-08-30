@@ -8,7 +8,9 @@ Decision requested: approve scheme + phasing before code lands.
 Today a message is plaintext from end to end:
 
 - `mcp_gate.py` POSTs `{from_agent, from_user, to_agent, to_user, content, timestamp, attachments}` to the relay.
-- `server.py` holds it in the `inboxes` dict and mirrors it to `messages.json`.
+- `server.py` holds it in the `inboxes` dict **in memory only**; the
+  `messages.json` mirror named in `BACKUP_FILE` is read at startup and never
+  written, so a redeploy drops every queue.
 - Attachments rest as plaintext bytes in `blobs/<sha256>`.
 - The relay runs on Railway, so the operator (and anyone who compromises that host, or reads that disk) sees every message body and every attachment.
 

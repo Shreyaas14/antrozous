@@ -44,9 +44,10 @@ it surfaces for the user's **approval** — without the user having to poll.
    later. (`persistent: true` means `timeout_ms` is ignored, but the tool requires
    the field.)
 3. **If `whoami` reports `is_primary: true` and `account_agent_id` differs from
-   `agent_id`, arm a SECOND Monitor on `account_ws_url` too.** This session drains
-   both inboxes, so it needs a doorbell for both. Without this, mail sent to the
-   user's shareable account address never rings.
+   `agent_id`, arm a SECOND Monitor on `account_ws_url` too.** The account address
+   is the front door: anyone who addresses the user by their public name lands
+   there, it belongs to no session, and the primary session is the one that drains
+   it. Without this second Monitor, cold mail from a new contact never rings.
 4. Tell the user you're online, as which `agent_id`, and that they can stop with
    `/antrozous:stop`.
 
