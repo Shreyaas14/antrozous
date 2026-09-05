@@ -1,7 +1,9 @@
 import contextlib
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -423,17 +425,9 @@ class FingerprintCacheTests(IsolatedIdentityTest):
 
         self.assertEqual(identity.saved_fingerprint(), "27uumo4l")
 
-    def test_suggestion_qualifies_a_legacy_id_from_the_cache(self):
-        identity.save_fingerprint("27uumo4l")
-        identity.set_agent_id(self.project, "agent-legacy")
-
-        self.assertEqual(
-            identity.suggest_session_id("agent-legacy"), "agent-legacy.27uumo4l"
-        )
-
 
 class SessionRegistryTests(IsolatedIdentityTest):
-    """Per-session ids: each tab registers so the next one is offered a free name."""
+    """register_session()/unregister_session() and live_sessions() bookkeeping."""
 
     def _fake_session(self, pid, agent_id):
         os.makedirs(identity.sessions_dir(), exist_ok=True)
@@ -451,12 +445,13 @@ class SessionRegistryTests(IsolatedIdentityTest):
     def test_unregister_without_registering_is_a_noop(self):
         identity.unregister_session()
 
-    def test_dead_sessions_are_pruned(self):
-        # PID 1 is alive but not ours; a very high pid is almost certainly free.
+    def test_dead_sessions_are_excluded_but_not_deleted(self):
+        # A very high pid is almost certainly free. Records are never garbage
+        # collected — the record has to survive so a resumed session can find it.
         self._fake_session(999999, "agent-ghost")
 
         self.assertNotIn(999999, identity.live_sessions())
-        self.assertEqual(os.listdir(identity.sessions_dir()), [])
+        self.assertIn("999999.json", os.listdir(identity.sessions_dir()))
 
     def test_malformed_session_files_are_ignored(self):
         os.makedirs(identity.sessions_dir(), exist_ok=True)
@@ -470,39 +465,91 @@ class SessionRegistryTests(IsolatedIdentityTest):
 
         identity.live_sessions()
 
-    def test_suggestion_is_the_base_when_nothing_is_running(self):
-        self.assertEqual(
-            identity.suggest_session_id("agent-shreyaas"), "agent-shreyaas"
-        )
-
-    def test_suggestion_avoids_live_ids(self):
-        identity.register_session("agent-shreyaas")
-
-        self.assertEqual(
-            identity.suggest_session_id("agent-shreyaas"), "agent-shreyaas-2"
-        )
-
-    def test_suggestion_walks_past_several_live_ids(self):
-        identity.register_session("agent-shreyaas")
-        self._fake_session(os.getppid(), "agent-shreyaas-2")
-
-        self.assertEqual(
-            identity.suggest_session_id("agent-shreyaas"), "agent-shreyaas-3"
-        )
-
-    def test_suggestion_stays_legal_for_a_long_base(self):
-        base = "a" * 63
-        identity.register_session(base)
-
-        suggested = identity.suggest_session_id(base)
-
-        self.assertIsNotNone(identity.normalize_agent_id(suggested), suggested)
-
     def test_live_sessions_is_empty_when_the_dir_is_missing(self):
         self.assertEqual(identity.live_sessions(), {})
 
     def test_sessions_live_under_the_overridable_home(self):
         self.assertTrue(identity.sessions_dir().startswith(self.home))
+
+
+class SessionKeyTests(IsolatedIdentityTest):
+    """Records are keyed by the Claude session so --resume reclaims its queue."""
+
+    def test_session_key_comes_from_the_claude_session_id(self):
+        with _env(CLAUDE_CODE_SESSION_ID="a133d3ce-293b-4c3a-9a83-5d5ec88a51ef"):
+            self.assertEqual(
+                identity.current_session_key(),
+                "a133d3ce-293b-4c3a-9a83-5d5ec88a51ef",
+            )
+
+    def test_session_key_falls_back_to_the_pid_outside_claude_code(self):
+        with _env(CLAUDE_CODE_SESSION_ID=None):
+            self.assertEqual(identity.current_session_key(), "pid-%d" % os.getpid())
+
+    def test_a_hostile_session_id_is_not_used_as_a_filename(self):
+        with _env(CLAUDE_CODE_SESSION_ID="../../etc/passwd"):
+            self.assertEqual(identity.current_session_key(), "pid-%d" % os.getpid())
+
+    def test_record_is_written_under_the_session_key(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            self.assertTrue(
+                os.path.exists(os.path.join(identity.sessions_dir(), "sess-one.json"))
+            )
+
+    def test_same_session_key_different_pid_reuses_the_record(self):
+        """This is what makes --resume keep its address."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            identity.unregister_session()
+            record = identity.session_records()["sess-one"]
+        self.assertEqual(record["agent_id"], "bob.aaaaaaaa")
+        self.assertIsNone(record["pid"])
+
+    def test_unregister_keeps_the_record_but_marks_it_not_live(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            identity.unregister_session()
+            self.assertIn("sess-one", identity.session_records())
+            self.assertNotIn("sess-one", identity.live_session_records())
+
+    def test_records_are_never_pruned(self):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "ghost.json"), "w") as f:
+            json.dump({"agent_id": "ghost.aaaaaaaa", "pid": 999999}, f)
+        self.assertIn("ghost", identity.session_records())
+        self.assertNotIn("ghost", identity.live_session_records())
+        self.assertTrue(
+            os.path.exists(os.path.join(identity.sessions_dir(), "ghost.json"))
+        )
+
+    def test_live_sessions_still_returns_pid_to_agent_id(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+        self.assertEqual(identity.live_sessions().get(os.getpid()), "bob.aaaaaaaa")
+
+    def test_one_unreadable_record_does_not_break_the_registry(self):
+        """Spec section 12. identity._read_json only catches a missing file and bad
+        JSON, so a permission error, a directory, or non-UTF-8 bytes would take the
+        whole registry down with it."""
+        if os.geteuid() == 0:
+            self.skipTest("running as root defeats permission-based tests")
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        good = os.path.join(identity.sessions_dir(), "good.json")
+        with open(good, "w") as f:
+            json.dump({"agent_id": "bob.aaaaaaaa", "pid": None}, f)
+        bad = os.path.join(identity.sessions_dir(), "bad.json")
+        with open(bad, "w") as f:
+            f.write("{}")
+        os.chmod(bad, 0o000)
+        self.addCleanup(os.chmod, bad, 0o600)
+        self.assertIn("good", identity.session_records())
+
+    def test_a_non_object_record_is_ignored(self):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "weird.json"), "w") as f:
+            f.write("[1, 2, 3]")
+        self.assertNotIn("weird", identity.session_records())
 
 
 class AccountAddressTests(IsolatedIdentityTest):
@@ -540,8 +587,19 @@ class PrimarySessionTests(IsolatedIdentityTest):
     """Exactly one session drains account mail, and the slot is self-healing."""
 
     def _fake_session(self, pid, agent_id, primary=False):
+        """A record for `pid`, stamped so a LIVE pid reads as genuinely live.
+
+        Liveness is the pid plus its process-start marker, so a record for a
+        running process has to carry that pid's real marker -- without it the
+        record models a stale leftover, not another live session, and every
+        "another session already holds the slot" test would be asserting against
+        the wrong scenario.
+        """
         os.makedirs(identity.sessions_dir(), exist_ok=True)
         record = {"agent_id": agent_id, "pid": pid}
+        marker = identity.pid_start_marker(pid)
+        if marker is not None:
+            record[identity._PID_START_KEY] = marker
         if primary:
             record["primary"] = True
         with open(os.path.join(identity.sessions_dir(), "%d.json" % pid), "w") as f:
@@ -603,6 +661,187 @@ class PrimarySessionTests(IsolatedIdentityTest):
 
         self.assertIsNone(identity.primary_pid())
 
+    def test_resuming_a_session_does_not_resurrect_a_stale_primary_flag(self):
+        """Regression: session records are now keyed by Claude session, not pid, so
+        a SIGKILLed primary's record survives forever (nothing is pruned) with
+        `primary: True` and a dead pid. A second session claims the now-vacant
+        slot. If the original session later resumes under the same session id but
+        a NEW pid, register_session() must not silently carry the stale `primary`
+        flag into the now-live record — that would produce two live primaries at
+        once, violating the single-holder invariant (spec section 6)."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-orig"):
+            os.makedirs(identity.sessions_dir(), exist_ok=True)
+            with open(
+                os.path.join(identity.sessions_dir(), "sess-orig.json"), "w"
+            ) as f:
+                json.dump(
+                    {"agent_id": "orig.27uumo4l", "pid": 999999, "primary": True}, f
+                )
+
+        with _env(CLAUDE_CODE_SESSION_ID="sess-other"):
+            identity.register_session("other.27uumo4l")
+            self.assertTrue(identity.claim_primary())
+
+        with _env(CLAUDE_CODE_SESSION_ID="sess-orig"):
+            # The original session resumes: same Claude session id, but a new pid
+            # (os.getpid() here is never 999999).
+            identity.register_session("orig.27uumo4l")
+
+        live_primaries = [
+            rec
+            for rec in identity.live_session_records().values()
+            if rec.get("primary")
+        ]
+        self.assertEqual(len(live_primaries), 1)
+
+
+class PidGenerationTests(IsolatedIdentityTest):
+    """A recycled pid must not resurrect a dead session's record.
+
+    Records are never pruned, so a SIGKILLed session's {"pid": N, "primary": true}
+    survives indefinitely. Once the OS hands pid N to an unrelated process a bare
+    _pid_alive(N) reports it live, claim_primary() refuses forever, nothing drains
+    the account address and whoami reports a phantom session. Liveness therefore
+    checks the pid's GENERATION -- its process start time -- not just the number.
+    """
+
+    def _write(self, key, record):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        with open(os.path.join(identity.sessions_dir(), "%s.json" % key), "w") as f:
+            json.dump(record, f)
+
+    def setUp(self):
+        super().setUp()
+        if identity.pid_start_marker() is None:
+            self.skipTest("no process-start marker available on this platform")
+
+    def test_marker_is_stamped_on_registration(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            record = identity.session_records()["sess-one"]
+        self.assertEqual(
+            record[identity._PID_START_KEY], identity.pid_start_marker(os.getpid())
+        )
+
+    def test_a_recycled_pid_does_not_make_a_dead_record_live(self):
+        """The whole point: this process IS alive and IS the recorded pid, but it
+        is a different generation of it than the one that wrote the record."""
+        self._write(
+            "ghost",
+            {
+                "agent_id": "ghost.aaaaaaaa",
+                "pid": os.getpid(),
+                identity._PID_START_KEY: "not-this-generation",
+            },
+        )
+        self.assertNotIn("ghost", identity.live_session_records())
+        self.assertNotIn(os.getpid(), identity.live_sessions())
+
+    def test_a_record_with_no_marker_is_dead_even_on_a_live_pid(self):
+        """Records predating the marker cannot be authenticated after the fact, and
+        the two errors are not symmetric: a false 'alive' wedges the front door
+        permanently, a false 'dead' costs one briefly double-claimed slot and
+        self-corrects at the next register_session()."""
+        self._write("legacy", {"agent_id": "legacy.aaaaaaaa", "pid": os.getpid()})
+        self.assertNotIn("legacy", identity.live_session_records())
+
+    def test_the_record_itself_still_resolves(self):
+        """Liveness changed; identity did not. A resumed session must still find
+        its own address in a record the liveness check rejects."""
+        self._write(
+            "ghost",
+            {
+                "agent_id": "ghost.aaaaaaaa",
+                "pid": os.getpid(),
+                identity._PID_START_KEY: "not-this-generation",
+            },
+        )
+        self.assertEqual(
+            identity.session_records()["ghost"]["agent_id"], "ghost.aaaaaaaa"
+        )
+
+    def test_a_wedged_primary_slot_is_reclaimable(self):
+        """The reported defect end to end: a hard-killed primary whose pid has been
+        recycled must not hold the front door shut.
+
+        The recycled pid is os.getppid(), not os.getpid(): an UNRELATED live
+        process is what recycling actually produces, and it is the only version of
+        the scenario that reaches claim_primary()'s refusal branch -- with this
+        process's own pid in the record, claim_primary() short-circuits on
+        "holder == os.getpid()" and returns True even unfixed.
+        """
+        self._write(
+            "ghost",
+            {
+                "agent_id": "ghost.aaaaaaaa",
+                "pid": os.getppid(),
+                identity._PID_START_KEY: "not-this-generation",
+                "primary": True,
+            },
+        )
+        with _env(CLAUDE_CODE_SESSION_ID="sess-live"):
+            identity.register_session("live.aaaaaaaa")
+            self.assertTrue(identity.claim_primary())
+            self.assertTrue(identity.is_primary())
+
+    def test_a_live_holder_with_a_matching_marker_still_keeps_the_slot(self):
+        """The other half: the marker must not make every holder look dead."""
+        self._write(
+            "other",
+            {
+                "agent_id": "other.aaaaaaaa",
+                "pid": os.getppid(),
+                identity._PID_START_KEY: identity.pid_start_marker(os.getppid()),
+                "primary": True,
+            },
+        )
+        with _env(CLAUDE_CODE_SESSION_ID="sess-live"):
+            identity.register_session("live.aaaaaaaa")
+            self.assertFalse(identity.claim_primary())
+
+    def test_unregister_drops_the_marker_with_the_pid(self):
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            identity.register_session("bob.aaaaaaaa")
+            identity.unregister_session()
+            record = identity.session_records()["sess-one"]
+        self.assertNotIn(identity._PID_START_KEY, record)
+
+    def test_a_platform_that_cannot_report_start_times_degrades_to_the_pid(self):
+        """A platform with no answer must fall back to the pre-marker behaviour, not
+        declare every running session dead."""
+        self._write("legacy", {"agent_id": "legacy.aaaaaaaa", "pid": os.getpid()})
+        self.addCleanup(
+            setattr, identity, "_pid_start_times", identity._pid_start_times
+        )
+        identity._pid_start_times = lambda pids: None
+        self.assertIn("legacy", identity.live_session_records())
+
+    def test_an_empty_answer_is_not_the_same_as_no_answer(self):
+        """{} means 'asked, and none of those pids exist'; None means 'cannot ask'.
+        Collapsing them would resurrect the bug on any platform that answers."""
+        self._write("legacy", {"agent_id": "legacy.aaaaaaaa", "pid": os.getpid()})
+        self.addCleanup(
+            setattr, identity, "_pid_start_times", identity._pid_start_times
+        )
+        identity._pid_start_times = lambda pids: {}
+        self.assertNotIn("legacy", identity.live_session_records())
+
+    def test_a_resumed_session_on_a_recycled_pid_gets_no_stale_primary(self):
+        """register_session()'s carry-forward is pid AND generation: landing on the
+        same pid number as a dead primary must not inherit its flag."""
+        with _env(CLAUDE_CODE_SESSION_ID="sess-one"):
+            self._write(
+                "sess-one",
+                {
+                    "agent_id": "bob.aaaaaaaa",
+                    "pid": os.getpid(),
+                    identity._PID_START_KEY: "not-this-generation",
+                    "primary": True,
+                },
+            )
+            identity.register_session("bob.aaaaaaaa")
+            self.assertNotIn("primary", identity.session_records()["sess-one"])
+
 
 class GitExclusionTests(unittest.TestCase):
     def test_project_identity_is_locally_git_ignored(self):
@@ -661,6 +900,441 @@ class GitExclusionTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(status.stdout, "")
+
+
+class AccountNameTests(IsolatedIdentityTest):
+    def test_account_name_falls_back_to_the_saved_agent_id(self):
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_explicit_account_name_wins(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["account_name"] = "anish-bot"
+        identity._write_json(path, record)
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_account_name_is_none_when_nothing_is_saved(self):
+        self.assertIsNone(identity.account_name())
+
+
+class HasExplicitAccountNameTests(IsolatedIdentityTest):
+    """The public accessor mcp_gate's migration offer uses to decide whether the
+    account name has already been recorded on purpose, as opposed to merely
+    derived from a saved agent_id -- without it the gate would have to reach
+    into identity's private read helper to ask the same question."""
+
+    def test_false_when_nothing_is_saved(self):
+        self.assertFalse(identity.has_explicit_account_name())
+
+    def test_false_when_only_derived_from_agent_id(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        self.assertFalse(identity.has_explicit_account_name())
+
+    def test_true_once_set_account_name_has_run(self):
+        identity.set_agent_id(self.home, "anish-bot-1.e5ox72jb")
+        identity.set_account_name("anish-bot-1")
+        self.assertTrue(identity.has_explicit_account_name())
+
+
+class SetAccountNameTests(IsolatedIdentityTest):
+    def test_sets_the_name_account_name_reads_back(self):
+        identity.set_account_name("anish-bot")
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_normalizes_the_name(self):
+        identity.set_account_name("  Anish-Bot  ")
+        self.assertEqual(identity.account_name(), "anish-bot")
+
+    def test_rejects_an_illegal_name(self):
+        with self.assertRaises(ValueError):
+            identity.set_account_name("!!!")
+
+    def test_preserves_the_rest_of_the_record(self):
+        """A read-modify-write that drops session_counter would hand out an
+        ordinal a second time -- the exact bug the identity lock exists to stop."""
+        identity.save_fingerprint("e5ox72jb")
+        identity.next_ordinal()
+        identity.next_ordinal()
+
+        identity.set_account_name("anish-bot")
+
+        record = self.global_record()
+        self.assertEqual(record["account_name"], "anish-bot")
+        self.assertEqual(record["fingerprint"], "e5ox72jb")
+        self.assertEqual(record["session_counter"], 2)
+
+
+class SessionAgentIdTests(IsolatedIdentityTest):
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def test_session_id_is_account_plus_ordinal(self):
+        self.assertEqual(
+            identity.session_agent_id(3), "anish-bot-3.e5ox72jb"
+        )
+
+    def test_session_id_uses_a_hyphen_not_a_dot(self):
+        self.assertNotIn(".1.", identity.session_agent_id(1))
+
+    def test_session_id_round_trips(self):
+        sid = identity.session_agent_id(3)
+        name, fp = identity.split_agent_id(sid)
+        self.assertEqual(name, "anish-bot-3")
+        self.assertEqual(fp, "e5ox72jb")
+        self.assertEqual(identity.compose_agent_id(name, fp), sid)
+
+    def test_session_id_matches_the_relay_grammar(self):
+        relay = re.compile(
+            r"^[a-z0-9][a-z0-9_-]{0,31}[a-z0-9]\.([a-z2-7]{8}|[a-z2-7]{16})$"
+        )
+        self.assertTrue(relay.match(identity.session_agent_id(12)))
+
+    def test_a_long_account_name_is_truncated_to_fit(self):
+        stem = "a" * 33
+        fitted = identity.fit_session_name(stem, 100)
+        self.assertLessEqual(len(fitted), 33)
+        self.assertTrue(fitted.endswith("-100"))
+        self.assertIsNotNone(identity.normalize_name(fitted))
+
+    def test_session_id_is_none_without_an_account_name(self):
+        os.unlink(identity._global_path())
+        self.assertIsNone(identity.session_agent_id(1))
+
+
+class SessionStemTierTests(IsolatedIdentityTest):
+    """A directory that opted out must send from ITS name, not the account's.
+
+    Regression. session_agent_id() derived the stem from account_name(), which reads
+    the GLOBAL record only, while account_agent_id() honours the project tier -- so
+    in a directory with .antrozous/identity.json the front door was the project id
+    but every outbound from_agent carried the global account's stem. Before the
+    session redesign the stem came from the winning tier and this could not happen;
+    README still promises "A directory can opt out and be its own agent".
+    """
+
+    def setUp(self):
+        super().setUp()
+        identity.save_fingerprint("e5ox72jb")
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+        identity.set_account_name("anish-bot")
+        identity.set_agent_id(self.project, "agent-foo-ab12.e5ox72jb", scope="project")
+
+    def test_project_override_supplies_the_stem(self):
+        self.assertEqual(identity.session_stem(self.project), "agent-foo-ab12")
+
+    def test_session_id_is_built_from_the_project_name(self):
+        self.assertEqual(
+            identity.session_agent_id(1, base_dir=self.project),
+            "agent-foo-ab12-1.e5ox72jb",
+        )
+
+    def test_the_session_id_and_the_front_door_agree_on_the_stem(self):
+        """The pair that disagreed: account_agent_id() already honoured the project
+        tier, so the two addresses named two different agents."""
+        front_door = identity.account_agent_id(self.project)
+        session = identity.session_agent_id(1, base_dir=self.project)
+        self.assertEqual(
+            identity.agent_name(front_door),
+            identity.agent_name(session).rsplit("-", 1)[0],
+        )
+
+    def test_find_directory_is_used_when_no_base_dir_is_given(self):
+        with _env(CLAUDE_PROJECT_DIR=self.project):
+            self.assertEqual(
+                identity.session_agent_id(2), "agent-foo-ab12-2.e5ox72jb"
+            )
+
+    def test_a_directory_without_an_override_still_uses_the_account(self):
+        plain = os.path.join(self._tmp.name, "plain")
+        os.makedirs(plain)
+        self.assertEqual(identity.session_agent_id(1, base_dir=plain),
+                         "anish-bot-1.e5ox72jb")
+
+    def test_an_env_pinned_id_wins_over_both(self):
+        with _env(AGENT_ID="pinned.e5ox72jb"):
+            self.assertEqual(
+                identity.session_agent_id(1, base_dir=self.project),
+                "pinned-1.e5ox72jb",
+            )
+
+    def test_asking_for_the_stem_does_not_create_a_global_record(self):
+        """session_stem() must not inherit resolve_agent_id()'s generate step: a
+        read that invents an account would make 'no account yet' unobservable and
+        silently name the user."""
+        os.unlink(identity._global_path())
+        plain = os.path.join(self._tmp.name, "plain2")
+        os.makedirs(plain)
+        self.assertIsNone(identity.session_stem(plain))
+        self.assertFalse(os.path.exists(identity._global_path()))
+
+
+class OrdinalCounterTests(IsolatedIdentityTest):
+    def setUp(self):
+        super().setUp()
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def test_counter_starts_at_one(self):
+        self.assertEqual(identity.next_ordinal(), 1)
+
+    def test_counter_increments_and_never_repeats(self):
+        seen = [identity.next_ordinal() for _ in range(5)]
+        self.assertEqual(seen, [1, 2, 3, 4, 5])
+        self.assertEqual(len(set(seen)), 5)
+
+    def test_counter_persists_across_reads(self):
+        identity.next_ordinal()
+        identity.next_ordinal()
+        self.assertEqual(
+            identity._read_json(identity._global_path())["session_counter"], 2
+        )
+
+    def test_counter_survives_a_rename(self):
+        identity.next_ordinal()
+        identity.next_ordinal()
+        identity.set_agent_id(self.home, "renamed.e5ox72jb")
+        self.assertEqual(identity.next_ordinal(), 3)
+
+    def test_account_name_survives_a_rename(self):
+        """_write_identity rebuilds the record from scratch; these keys must be
+        carried forward with the fingerprint or a rename resets the ordinals."""
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["account_name"] = "anish-bot"
+        identity._write_json(path, record)
+        identity.set_agent_id(self.home, "renamed.e5ox72jb")
+        self.assertEqual(
+            identity._read_json(path).get("account_name"), "anish-bot"
+        )
+
+    def test_seeding_lifts_the_counter_above_existing_ordinals(self):
+        os.makedirs(identity.sessions_dir(), exist_ok=True)
+        for n, name in enumerate(["anish-bot-2", "anish-bot-7", "anish-bot-3"]):
+            with open(os.path.join(identity.sessions_dir(), "s%d.json" % n), "w") as f:
+                json.dump({"agent_id": "%s.e5ox72jb" % name, "pid": None}, f)
+        self.assertEqual(identity.seed_counter_from_records(), 7)
+        self.assertEqual(identity.next_ordinal(), 8)
+
+    def test_seeding_with_no_records_leaves_the_counter_alone(self):
+        self.assertEqual(identity.seed_counter_from_records(), 0)
+        self.assertEqual(identity.next_ordinal(), 1)
+
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+class OrdinalConcurrencyTests(IsolatedIdentityTest):
+    """next_ordinal() must be safe against real concurrent processes.
+
+    Threads in one process share the GIL around any single bytecode op but not
+    across a read-a-file / compute / write-a-file sequence, and more to the point
+    would not exercise cross-process file locking at all. Only separate OS
+    processes hitting the same ANTROZOUS_HOME are a faithful test of the race:
+    two sessions launched close together must never be handed the same ordinal,
+    or they end up with the same agent id and drain each other's relay queue.
+    """
+
+    def setUp(self):
+        super().setUp()
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def test_concurrent_processes_never_get_the_same_ordinal(self):
+        n = 20
+        code = "import identity; print(identity.next_ordinal())"
+        env = os.environ.copy()
+        env["ANTROZOUS_HOME"] = self.home
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(n)
+        ]
+        results = [int(p.communicate(timeout=10)[0].strip()) for p in procs]
+        self.assertEqual(
+            sorted(results),
+            list(range(1, n + 1)),
+            "ordinals were not distinct/consecutive: %r" % (results,),
+        )
+
+
+class IdentityRecordLockTests(IsolatedIdentityTest):
+    """Every writer of ~/.antrozous/identity.json must hold the same lock.
+
+    A lock scoped to the counter alone guards counter-writer against
+    counter-writer and nothing else. save_fingerprint(), mark_confirmed() and
+    set_agent_id() each do their own read-modify-write of that same file, and at
+    startup a session runs one of those CONCURRENTLY with next_ordinal() (the gate
+    calls ensure_keys() -> save_fingerprint() on the main thread while the identity
+    prompt fires set_agent_id() off a Timer thread). Interleaved, the unrelated
+    writer reads session_counter=N, next_ordinal() persists N+1 and hands it out,
+    then the unrelated writer's write lands and puts the counter back to N. The
+    next session is then handed N+1 a second time -- and two sessions on the same
+    ordinal share an agent id, therefore a relay queue, therefore drain each
+    other's mail. That is the isolation failure the counter exists to prevent.
+
+    Real subprocesses, not threads: flock is a cross-PROCESS primitive and threads
+    would not exercise it. The interleaving is made deterministic rather than
+    hoped for -- the slow writer announces READY from inside its own
+    read-modify-write and only then is next_ordinal() launched, so a passing run
+    is a real ordering guarantee and not a lucky one.
+    """
+
+    #: How long the slow writer stalls mid-write. Only has to outlast a fresh
+    #: interpreter start plus one next_ordinal(); the READY handshake below is what
+    #: makes the ordering deterministic, so this need not be generous.
+    STALL = 1.0
+
+    def setUp(self):
+        super().setUp()
+        identity.set_agent_id(self.home, "anish-bot.e5ox72jb")
+
+    def _child_env(self):
+        env = os.environ.copy()
+        env["ANTROZOUS_HOME"] = self.home
+        return env
+
+    def _spawn_stalled_writer(self, call):
+        """Run `call` in a child that stalls between reading and writing the record.
+
+        _write_json is the last step of every read-modify-write here, so stalling
+        inside it parks the child with a stale copy of the record in hand -- exactly
+        the window the lock has to close.
+        """
+        code = "\n".join(
+            [
+                "import sys, time",
+                "import identity",
+                "_real = identity._write_json",
+                "def stalled(path, record):",
+                "    if path == identity._global_path():",
+                "        sys.stdout.write('READY\\n')",
+                "        sys.stdout.flush()",
+                "        time.sleep(%f)" % self.STALL,
+                "    _real(path, record)",
+                "identity._write_json = stalled",
+                call,
+            ]
+        )
+        return subprocess.Popen(
+            [sys.executable, "-c", code],
+            cwd=REPO_ROOT,
+            env=self._child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _take_ordinal(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import identity; print(identity.next_ordinal())"],
+            cwd=REPO_ROOT,
+            env=self._child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, "next_ordinal() child failed:\n" + err)
+        return int(out.strip())
+
+    def _assert_does_not_clobber_the_counter(self, call):
+        for _ in range(5):
+            identity.next_ordinal()
+
+        writer = self._spawn_stalled_writer(call)
+        self.addCleanup(writer.kill)
+        ready = writer.stdout.readline()
+        self.assertEqual(
+            ready.strip(),
+            "READY",
+            "the stalled writer never reached its write of the global record",
+        )
+
+        handed_out = self._take_ordinal()
+        rest, err = writer.communicate(timeout=self.STALL + 10)
+        self.assertEqual(writer.returncode, 0, "stalled writer failed:\n" + err)
+
+        self.assertEqual(handed_out, 6)
+        record = identity._read_json(identity._global_path()) or {}
+        self.assertEqual(
+            record.get("session_counter"),
+            handed_out,
+            "%s overwrote the counter with its stale copy: ordinal %d was handed "
+            "out but the file says %r, so the next session gets %d again"
+            % (call, handed_out, record.get("session_counter"), handed_out),
+        )
+        self.assertEqual(identity.next_ordinal(), 7)
+
+    def test_save_fingerprint_does_not_clobber_a_concurrent_ordinal(self):
+        self._assert_does_not_clobber_the_counter(
+            'identity.save_fingerprint("27uumo4l")'
+        )
+
+    def test_set_agent_id_does_not_clobber_a_concurrent_ordinal(self):
+        self._assert_does_not_clobber_the_counter(
+            "identity.set_agent_id(%r, 'renamed.e5ox72jb')" % self.home
+        )
+
+    def test_mark_confirmed_does_not_clobber_a_concurrent_ordinal(self):
+        # mark_confirmed only writes when the record is not already confirmed, and
+        # set_agent_id leaves it confirmed; clear the flag so it really writes.
+        path = identity._global_path()
+        record = identity._read_json(path)
+        record["confirmed"] = False
+        identity._write_json(path, record)
+        self._assert_does_not_clobber_the_counter(
+            "identity.mark_confirmed(%r)" % self.home
+        )
+
+
+class WriteJsonTempPathTests(IsolatedIdentityTest):
+    """_write_json's temp file must not be shared between processes.
+
+    A single hardcoded `path + '.tmp'` means two processes writing the same target
+    write the SAME temp file, and the loser's os.replace can fire after the winner
+    already renamed it away -- a bare FileNotFoundError out of a function whose
+    whole job is to make the write atomic.
+    """
+
+    def test_temp_path_is_unique_per_process(self):
+        home = self.home
+        code = "\n".join(
+            [
+                "import identity",
+                "seen = []",
+                "_real_replace = identity.os.replace",
+                "def spy(tmp, dst):",
+                "    seen.append(tmp)",
+                "    _real_replace(tmp, dst)",
+                "identity.os.replace = spy",
+                "identity._write_json(identity._global_path(), {'agent_id': 'x'})",
+                "print(seen[0])",
+            ]
+        )
+        env = os.environ.copy()
+        env["ANTROZOUS_HOME"] = home
+        outs = []
+        for _ in range(2):
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            outs.append(proc.stdout.strip())
+        self.assertNotEqual(
+            outs[0], outs[1], "two processes shared one temp path: %r" % (outs,)
+        )
 
 
 if __name__ == "__main__":

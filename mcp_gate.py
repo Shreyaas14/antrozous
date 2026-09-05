@@ -238,6 +238,8 @@ def _elicit(message, schema=None):
             return result.get("action", "cancel"), (result.get("content") or {})
         if _handle_startup_reply(m):
             continue
+        if _handle_migration_reply(m):
+            continue
         if m.get("method") == "ping" and m.get("id") is not None:
             send({"jsonrpc": "2.0", "id": m["id"], "result": {}})
 
@@ -538,17 +540,24 @@ def account_agent_id():
 
 
 def inbox_addresses():
-    """This session polls its own queue and nothing else.
+    """The queues this session drains: its own, plus the front door if primary.
 
-    Sessions are isolated on purpose: two tabs on one device are two separate
-    agents, and one must never surface — or consume — the other's mail. A session
-    draining its neighbours would also mean approving messages on their behalf,
-    which is the one decision this gate never takes for you.
+    Session queues are PRIVATE — a session never reads another live session's mail,
+    because draining it would mean approving that session's messages on its behalf.
 
-    Queues left behind by a rename or a closed tab are NOT swept up here. They are
-    reported by other_queues() and drained only when the user asks.
+    The account address is different. It is the front door: the alias resolves to it
+    (/resolve maps a bare name to a fingerprint and the sender composes
+    <name>.<fingerprint>), first-claim-wins means it can never be repointed at a
+    session, and so it belongs to no session. If nothing drained it, cold mail from
+    a new contact would be invisible. Exactly one live session does — the primary.
     """
-    return [current_agent_id()]
+    session = current_agent_id()
+    addresses = [session]
+    if identity.is_primary():
+        account = account_agent_id()
+        if account and account != session:
+            addresses.append(account)
+    return addresses
 
 
 def other_queues():
@@ -586,8 +595,366 @@ def _adopt_session_id(agent_id):
     return agent_id
 
 
+def needs_account_setup():
+    """True only on a first run — no confirmed account name exists yet."""
+    if os.environ.get("AGENT_ID", "").strip():
+        return False
+    info = identity.describe(identity.find_directory())
+    return bool(info["needs_setup"]) or not identity.account_name()
+
+
+def resume_or_assign_session_id():
+    """This session's address: its own record if it has one, else the next ordinal.
+
+    Reusing the record is what makes `claude --resume` come back to the same queue,
+    and it is why a resumed session must not take a new ordinal. The freshly derived
+    id is registered immediately (not left to the caller) so a second call for the
+    same session — including one that never goes through _adopt_session_id — finds
+    the same record instead of burning another ordinal.
+    """
+    existing = identity.session_records().get(identity.current_session_key())
+    if existing and existing.get("agent_id"):
+        return existing["agent_id"]
+    # session_stem(), not account_name(): a directory with .antrozous/identity.json
+    # is its own agent, and its sessions must be numbered from ITS name so the
+    # from_agent on their outbound mail is an address that directory owns. Asking
+    # account_name() here sent them out under the GLOBAL account's stem.
+    if not identity.session_stem():
+        return None
+    new_id = identity.session_agent_id(identity.next_ordinal())
+    if new_id:
+        identity.register_session(new_id)
+    return new_id
+
+
+def migration_candidate():
+    """The stem a legacy account name would become, or None.
+
+    None means either the name is already clean, or an explicit account_name is
+    already on record -- the latter is what stops this offer repeating every
+    launch once a decision (accept OR decline) has been recorded.
+
+    An account name ending in a number is almost always a session ordinal
+    someone typed into the old per-session popup, before every session derived
+    its own number automatically. Left in place, sessions become
+    anish-bot-1-1, anish-bot-1-2.
+    """
+    if identity.has_explicit_account_name():
+        return None
+    name = identity.account_name()
+    if not name:
+        return None
+    match = identity.ORDINAL_SUFFIX_RE.match(name)
+    if not match:
+        return None
+    return identity.normalize_name(match.group("stem"))
+
+
+def apply_account_migration(accepted):
+    """Record a migration decision when one was actually made, and ALWAYS seed
+    the ordinal counter -- regardless of the decision, and regardless of
+    whether a decision was made at all.
+
+    accepted=True  -- record the stripped candidate (an acceptance).
+    accepted=False -- record the CURRENT name verbatim (an explicit decline;
+                       recording it is what stops the offer repeating -- see
+                       migration_candidate()'s has_explicit_account_name()
+                       check -- but only once the write actually lands: if
+                       identity.set_account_name() raises below, nothing is
+                       recorded, so the offer comes back next launch. That
+                       retry-on-failure is intentional: a transient write
+                       failure must not silently and permanently record a
+                       decision nobody confirmed).
+    accepted=None  -- record nothing (the popup was dismissed, cancelled, or
+                       never answered at all -- not a decision, so the offer
+                       returns next launch). The counter is still seeded:
+                       some other session may already have taken ordinals
+                       under the CURRENT stem's numbering, and this session
+                       is about to take its own ordinal next regardless.
+
+    Written through identity.set_account_name() rather than a direct read/
+    write of the global record: that helper takes the identity lock that also
+    guards session_counter, so this cannot race a concurrent next_ordinal()
+    and drop its increment -- which would hand the same ordinal, and the same
+    relay queue, to two sessions. ValueError/OSError from that write are
+    logged, not raised -- this runs on the startup path, where an unhandled
+    exception would stop a session from becoming usable.
+    """
+    name = None
+    if accepted is True:
+        name = migration_candidate()
+    elif accepted is False:
+        name = identity.account_name()
+    if name:
+        try:
+            identity.set_account_name(name)
+        except (ValueError, OSError) as e:
+            log(
+                "could not record account migration decision (%r): %s -- will "
+                "offer again next launch" % (name, e)
+            )
+    identity.seed_counter_from_records()
+    return name
+
+
+# Elicitation for the migration offer is fire-and-forget, exactly like the
+# first-run popup (STARTUP_RID above) and for the same two reasons:
+#
+# 1. Claude Code discards elicitation that arrives during initialization (see
+#    STARTUP_DELAY's comment) -- this is sent from the same
+#    notifications/initialized handler, so it is just as subject to that.
+# 2. A BLOCKING _elicit() call here would read from the SAME stdin the main
+#    loop reads from. Any other request that arrived while it waited --
+#    tools/list included -- would be silently discarded by _elicit's own read
+#    loop (it only recognizes its own reply, startup-reply messages, and
+#    pings), never answered. If the client had in fact discarded the
+#    elicitation request per point 1, that answer would never come, and the
+#    whole MCP session would look permanently hung -- worse than the offer
+#    simply never firing.
+MIGRATION_RID = "antrozous-migration-offer"
+_migration_pending = False
+_migration_timer = None
+_migration_lock = threading.Lock()
+
+# How long to wait for an answer before giving up and continuing anyway. Only
+# reached if the client claimed elicitation support but never actually
+# answers (a dropped request, a closed popup, a client that only PARTIALLY
+# implements the capability) -- see offer_account_migration's docstring for
+# why this session must become addressable regardless.
+#
+# This has to be long enough for a person to actually read the ~10-line
+# prompt and click Accept, not just long enough for a client to round-trip
+# the request. A reply that arrives after this fires is discarded (see
+# _handle_migration_reply) -- by then _finish_identity_setup() has already
+# taken an ordinal under the old stem, so retroactively applying a late
+# accept would reintroduce the ordinal-reuse hazard this whole feature
+# exists to prevent. The offer simply returns next launch instead. A short
+# timeout here doesn't make that safer, it just makes a slow reader lose the
+# offer, silently, every single time.
+try:
+    MIGRATION_ANSWER_TIMEOUT = float(os.environ.get("ANTROZOUS_MIGRATION_TIMEOUT", "180"))
+except ValueError:
+    MIGRATION_ANSWER_TIMEOUT = 180.0
+
+
+def _finish_identity_setup():
+    """Adopt this session's derived id and (re)publish keys.
+
+    The ordering constraint is the RESEED, not the migration decision. An earlier
+    docstring here claimed this "must run AFTER any such decision"; the code never
+    required that -- apply_account_migration() calls
+    identity.seed_counter_from_records() unconditionally, on every branch including
+    accepted=None, so the high-water mark is raised whatever the user answers and
+    whether or not they answer at all. What must not happen is
+    resume_or_assign_session_id() taking an ordinal before that reseed, because it
+    could hand out a number some other queue already uses.
+
+    So schedule_identity_setup() reseeds and calls this BEFORE the migration popup
+    is sent. Waiting for the answer left the session unaddressable for
+    STARTUP_DELAY + MIGRATION_ANSWER_TIMEOUT = 183s, during which current_agent_id()
+    fell through to the ACCOUNT address: whoami handed the antrozous-inbox skill the
+    account ws_url, the skill armed its Monitor there, and it stayed there for the
+    rest of the session once adoption switched to <stem>-N -- so mail to the
+    session's own queue rang nothing. The SessionStart hook tells the model to arm
+    on its first turn, which reliably lands inside that window.
+
+    Adopting first confines the migration to the account stem and to future
+    sessions, which is already exactly what a timeout does today.
+
+    Idempotent: a second call once this session has adopted is a no-op, so the
+    backstop calls left in _handle_migration_reply/_migration_timeout (the paths
+    that must guarantee an address even if nothing else ran) cost nothing.
+    """
+    if SESSION_AGENT_ID:
+        return
+    chosen = resume_or_assign_session_id()
+    if chosen:
+        _adopt_session_id(chosen)
+        threading.Thread(target=_publish_identities, daemon=True).start()
+
+
+def offer_account_migration():
+    """Ask, once, whether to strip a legacy session ordinal off the account
+    name. A no-op (straight to _finish_identity_setup) when there is nothing
+    to migrate. Declines automatically -- rather than asking, and finishing
+    immediately -- when the client cannot show a popup, since there is no
+    other way to get an answer.
+
+    When a popup IS sent, it is fire-and-forget (see the comment above
+    MIGRATION_RID): this function returns immediately. It does not adopt
+    anything either way -- schedule_identity_setup() has already reseeded the
+    counter and adopted this session's id before calling here, precisely so the
+    session is addressable while the popup is on screen (see
+    _finish_identity_setup).
+    """
+    candidate = migration_candidate()
+    if not candidate:
+        return
+    if not CLIENT_ELICITATION:
+        apply_account_migration(accepted=False)
+        return
+
+    current_stem = identity.account_name()
+    ordinal = current_stem.rsplit("-", 1)[1]
+    current_address = account_agent_id()
+    fingerprint = identity.split_agent_id(current_address)[1]
+    new_address = identity.compose_agent_id(candidate, fingerprint) or candidate
+
+    # "Address" (qualified, with fingerprint) and "account name" (the bare stem)
+    # are kept distinct throughout: the fingerprint suffix means the ADDRESS
+    # never literally ends in the ordinal, only the account name does, and
+    # conflating the two here is exactly the class of user-facing-text-vs-code
+    # mismatch flagged repeatedly elsewhere in this plan.
+    prompt = (
+        "SHORTEN YOUR ANTROZOUS ADDRESS?\n\n"
+        "Your address is %s. The account name in it, %s, already ends in "
+        "'-%s' -- probably a session number typed into an older prompt, from "
+        "before every session numbered itself automatically.\n\n"
+        "Left as-is, every session's own id is built by appending another "
+        "'-<number>' onto that name: %s-<number>, doubled up.\n\n"
+        "Accept = your account name becomes %s (address: %s), so sessions "
+        "are named %s-<number>.\n"
+        "Decline = keep %s exactly as it is.\n\n"
+        "Either way, people who already have %s still reach you -- the relay "
+        "binds an alias to your key's fingerprint, first claim wins, and an "
+        "alias is never reassigned to a different name, so accepting does "
+        "not move it. That mail just lands in a separate queue this session "
+        "does not poll by default; check_inbox lists it as an OTHER QUEUE so "
+        "you can go read it."
+        % (
+            current_address,
+            current_stem,
+            ordinal,
+            current_stem,
+            candidate,
+            new_address,
+            candidate,
+            current_stem,
+            current_stem,
+        )
+    )
+
+    global _migration_pending, _migration_timer
+    with _migration_lock:
+        _migration_pending = True
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": MIGRATION_RID,
+            "method": "elicitation/create",
+            "params": {"message": prompt, "requestedSchema": _EMPTY_SCHEMA},
+        }
+    )
+    log("offered to shorten account name %s -> %s" % (current_stem, candidate))
+    _migration_timer = threading.Timer(MIGRATION_ANSWER_TIMEOUT, _migration_timeout)
+    _migration_timer.daemon = True
+    _migration_timer.start()
+
+
+def _handle_migration_reply(m):
+    """Apply the migration popup's answer, if this message is it, then finish
+    identity setup. Returns True if this message was consumed.
+
+    Mutually exclusive with _migration_timeout via _migration_lock: whichever
+    of the two fires first consumes _migration_pending (and cancels the
+    other), so identity setup finishes exactly once. A reply that arrives
+    after the timeout already fired is deliberately ignored -- by then no
+    decision was recorded (see _migration_timeout), so the offer already
+    knows to come back next launch, and a stale late answer for THIS session
+    is not retroactively applied.
+
+    Only an explicit "accept" or "decline" counts as a decision. Anything
+    else -- "cancel", a dismissal, an elicitation the client rejects outright
+    with an error -- is treated as no decision at all, exactly like
+    do_set_identity's own decline/dismiss split (see its "It will be offered
+    again next session" branch). Collapsing them, as an earlier version of
+    this function did, meant a client that simply REJECTS this elicitation
+    request would look identical to a user who typed "no" -- permanently and
+    silently recording the un-migrated name as explicit and suppressing the
+    offer forever, with no way to tell "user declined" apart from "client
+    couldn't ask" in the log.
+    """
+    global _migration_pending
+    with _migration_lock:
+        if not _migration_pending or m.get("id") != MIGRATION_RID:
+            return False
+        _migration_pending = False
+    if _migration_timer is not None:
+        _migration_timer.cancel()
+
+    action = "cancel"
+    if "error" not in m:
+        action = (m.get("result") or {}).get("action", "cancel")
+
+    if action == "accept":
+        apply_account_migration(accepted=True)
+    elif action == "decline":
+        apply_account_migration(accepted=False)
+    else:
+        apply_account_migration(accepted=None)
+        log("migration prompt %s; will offer again next launch" % action)
+
+    # Backstop only: schedule_identity_setup() adopts before the popup is sent, so
+    # this is a no-op on the real startup path. It stays because "this session ends
+    # up with an address" must not depend on any one caller having run first.
+    _finish_identity_setup()
+    return True
+
+
+def _migration_timeout():
+    """Fires if offer_account_migration's popup never gets an answer at all --
+    see its docstring, and the comment above MIGRATION_RID, for why this
+    session must become addressable regardless."""
+    global _migration_pending
+    with _migration_lock:
+        if not _migration_pending:
+            return
+        _migration_pending = False
+    log(
+        "migration prompt got no answer within %.0fs; keeping the current "
+        "name and continuing" % MIGRATION_ANSWER_TIMEOUT
+    )
+    apply_account_migration(accepted=None)
+    # Backstop, as in _handle_migration_reply -- normally already adopted.
+    _finish_identity_setup()
+
+
 def schedule_identity_setup():
     """Claude Code discards elicitation received during initialization, so wait."""
+    if os.environ.get("AGENT_ID", "").strip():
+        # current_agent_id() checks $AGENT_ID first, so it is already this
+        # session's address. Deriving and registering a different one here would
+        # advertise an address the session never actually answers on, and would
+        # burn an ordinal every launch for an id nothing ever uses.
+        return
+    if not needs_account_setup():
+        # Adopt this session's own id NOW -- before the migration popup is even
+        # scheduled, let alone answered. Everything the ordinal depends on is
+        # already known: the reseed below is what apply_account_migration() runs
+        # unconditionally on every branch anyway, so it does not depend on the
+        # user's answer. Deferring adoption behind the popup left this session
+        # answering as the ACCOUNT address for STARTUP_DELAY +
+        # MIGRATION_ANSWER_TIMEOUT = 183s, long enough for the antrozous-inbox
+        # skill to arm its Monitor on the wrong socket for the rest of the session.
+        identity.seed_counter_from_records()
+        _finish_identity_setup()
+        if migration_candidate() and CLIENT_ELICITATION and STARTUP_DELAY > 0:
+            # A migration popup is elicitation too, sent from this same
+            # notifications/initialized handler -- deferred for the same
+            # reason the first-run popup below is (see STARTUP_DELAY's
+            # comment). Deferred ONLY when there is actually something to
+            # send: the common case (nothing to migrate) stays exactly as
+            # fast as it always was, with no Timer involved at all.
+            t = threading.Timer(STARTUP_DELAY, offer_account_migration)
+            t.daemon = True
+            t.start()
+        else:
+            # Either nothing to offer, the client cannot be asked, or
+            # STARTUP_DELAY<=0 (tests; a deliberately-configured client) --
+            # offer_account_migration() itself is still fire-and-forget when
+            # it does send a popup, so calling it inline here never blocks.
+            offer_account_migration()
+        return
     if STARTUP_DELAY <= 0:
         offer_identity_setup()
         return
@@ -596,45 +963,42 @@ def schedule_identity_setup():
     t.start()
 
 
-def _session_prompt(info, suggested_name, fp, peers):
+def _session_prompt(suggested_name, fp, peers):
+    """The first-run popup's copy. There is no other run this fires on, so every
+    line below has to be true of naming the ACCOUNT — not a per-tab choice."""
     full_id = identity.compose_agent_id(suggested_name, fp) or suggested_name
-    # First run names YOU; later runs name the tab. Saying "session only" on the
-    # first run was simply false, and saying it quietly on later runs let people
-    # believe they had renamed themselves when they had not.
-    if info["needs_setup"]:
-        where = (
-            "This is your FIRST run, so this name becomes YOUR ADDRESS — the one you "
-            "give other people. You can change it later with the set_identity tool."
-        )
-    else:
-        where = (
-            "Names THIS TAB only. Your address stays %s no matter what you type here "
-            "— use the set_identity tool to change that." % info["agent_id"]
-        )
     peer_note = ""
     if peers:
         peer_note = "\n\nOther sessions running right now:\n" + "\n".join(
             "  - %s (pid %d)" % (a, p) for p, a in sorted(peers.items())
         )
-    account = identity.account_agent_id(identity.find_directory())
     prompt = (
-        "THIS SESSION'S ANTROZOUS AGENT ID\n\n"
-        "This session: %s\n"
-        "Your address: %s   <- give THIS to other people\n\n"
-        "%s%s\n\n"
-        "The %s suffix is a digest of your identity key, so someone else picking the "
-        "same name still gets a different id and cannot receive your messages.\n\n"
-        "Your address works from any of your sessions. The session id above is for "
-        "addressing this specific tab, e.g. one agent messaging another.\n\n"
+        "NAME YOUR ANTROZOUS ACCOUNT\n\n"
+        "This is your FIRST run, so the name below becomes YOUR ADDRESS — the one "
+        "you give other people. Accepting %s would save it as %s.\n\n"
+        "It is chosen once. Each session you open is numbered from it "
+        "automatically (%s-1, %s-2, ...) with no further prompts — including this "
+        "one, which becomes %s-1. That numbered address, not the bare account "
+        "name, is what shows up as the return address on anything you send from "
+        "this session; %s stays reachable as your public front door regardless. "
+        "Use the set_identity tool later if you want to change the account "
+        "name.\n\n"
+        "The %s suffix is a digest of your identity key, so someone else picking "
+        "the same name still gets a different address and cannot receive your "
+        "messages.%s\n\n"
         "Type just the name below (a-z, 0-9, dash, underscore).\n\n"
-        "Accept = use this id.   Decline = use %s."
+        "Accept = save this as your account address.   "
+        "Decline = this session gets no address at all (set_identity opts back "
+        "in later)."
         % (
+            suggested_name,
             full_id,
-            account,
-            where,
-            peer_note,
+            suggested_name,
+            suggested_name,
+            suggested_name,
+            suggested_name,
             ("." + fp) if fp else "fingerprint",
-            info["agent_id"],
+            peer_note,
         )
     )
     schema = {
@@ -642,7 +1006,7 @@ def _session_prompt(info, suggested_name, fp, peers):
         "properties": {
             "name": {
                 "type": "string",
-                "title": "Name for this session",
+                "title": "Name for your account",
                 "description": "Your key fingerprint is appended automatically.",
                 "default": suggested_name,
                 "minLength": 2,
@@ -655,7 +1019,8 @@ def _session_prompt(info, suggested_name, fp, peers):
 
 
 def offer_identity_setup():
-    """Ask for this session's id. Fires every launch so each tab can differ."""
+    """Ask for the account name. schedule_identity_setup only calls this on a
+    first run — every later session derives its id without asking."""
     global _startup_pending, _startup_suggested, _startup_fingerprint
     if not CLIENT_ELICITATION:
         return
@@ -675,12 +1040,10 @@ def offer_identity_setup():
     _startup_fingerprint = identity.saved_fingerprint() or ensure_keys()
     info = identity.describe(base_dir)
     peers = identity.live_sessions()
-    _startup_suggested = identity.suggest_session_name(
-        identity.agent_name(info["agent_id"])
-    )
-    prompt, schema = _session_prompt(
-        info, _startup_suggested, _startup_fingerprint, peers
-    )
+    # This only ever runs on a first run (schedule_identity_setup's gate), so there
+    # is no account name yet to suggest — just the placeholder id's name part.
+    _startup_suggested = identity.agent_name(info["agent_id"])
+    prompt, schema = _session_prompt(_startup_suggested, _startup_fingerprint, peers)
     _startup_pending = True
     send(
         {
@@ -733,34 +1096,30 @@ def _handle_startup_reply(m):
     if isinstance(typed, str) and typed.strip():
         chosen_name = typed.strip()
 
+    info = identity.describe(base_dir)
     name = identity.normalize_name(chosen_name)
     if name is None:
-        log("rejected session name %r; keeping saved id" % chosen_name)
+        log("rejected account name %r; keeping saved id" % chosen_name)
         _adopt_session_id(identity.resolve_agent_id(base_dir))
         _publish_identities()
         return True
 
-    full_id = identity.compose_agent_id(name, _startup_fingerprint) or name
-    _adopt_session_id(full_id)
-    info = identity.describe(base_dir)
-
-    # The FIRST run names you; every launch after that names the tab. Renaming your
-    # actual address is set_identity's job, deliberately — a name typed at launch
-    # should never silently become the address you hand out, and sessions have to be
-    # free to differ so agents on one machine can message each other.
-    if info["needs_setup"]:
-        try:
-            identity.set_agent_id(
-                base_dir, full_id, drop_project_override=info["source"] == "project"
-            )
-        except (ValueError, OSError) as e:
-            log("could not save default id:", e)
-    elif full_id != account_agent_id():
-        log(
-            "session named %s; account address stays %s (set_identity to change it)"
-            % (full_id, account_agent_id())
+    # This prompt only ever fires on a first run, so what is accepted here names the
+    # ACCOUNT, not this one tab. The account name is written FIRST, and only then is
+    # this session's own id derived from it — deriving before the write would read a
+    # stale or absent stem.
+    account_id = identity.compose_agent_id(name, _startup_fingerprint) or name
+    try:
+        identity.set_agent_id(
+            base_dir, account_id, drop_project_override=info["source"] == "project"
         )
-    log("session id set to", full_id)
+        identity.set_account_name(name)
+    except (ValueError, OSError) as e:
+        log("could not save account name:", e)
+
+    chosen = resume_or_assign_session_id()
+    _adopt_session_id(chosen or account_id)
+    log("account is %s; this session is %s" % (account_id, chosen or account_id))
     # AFTER the saved default is written: the account address derives from it, and
     # publishing earlier would advertise keys under the pre-rename address.
     _publish_identities()
@@ -1271,9 +1630,6 @@ def _ws_url(agent_id):
 
 
 def do_whoami(_id, _args):
-    # ws_url derives from THIS gate's RELAY_URL and agent_id, so a Monitor armed on
-    # it can never point at a different relay than check_inbox uses.
-    info = identity.describe(identity.find_directory())
     agent_id = current_agent_id()
     if agent_id is None:
         # Declined at startup. Report the state plainly instead of inventing an id;
@@ -1293,6 +1649,15 @@ def do_whoami(_id, _args):
             ),
         )
         return
+    tool_result(_id, json.dumps(whoami_payload()))
+
+
+def whoami_payload():
+    """The whoami dict. Split out of do_whoami so it can be asserted on directly."""
+    # ws_url derives from THIS gate's RELAY_URL and agent_id, so a Monitor armed on
+    # it can never point at a different relay than check_inbox uses.
+    info = identity.describe(identity.find_directory())
+    agent_id = current_agent_id()
     account = account_agent_id()
     source = (
         "env"
@@ -1306,6 +1671,7 @@ def do_whoami(_id, _args):
         "agent_id": agent_id,
         "account_agent_id": account,
         "share_this": account,
+        "sends_from": agent_id,
         "source": source,
         "is_primary": identity.is_primary(),
         "polls_inboxes": polls,
@@ -1315,13 +1681,11 @@ def do_whoami(_id, _args):
         "account_ws_url": _ws_url(account),
     }
     if account != agent_id:
-        # Sends, key publishing and the alias all use the ACCOUNT address, so a
-        # differing session name is exactly the state where someone hands out a
-        # name nobody ever sees on their messages. Say it outright.
         out["note"] = (
-            "This session is named %s, but your messages go out as %s — that is the "
-            "address to give people. Rename the account with set_identity if you "
-            "wanted %s to be your real address." % (agent_id, account, agent_id)
+            "Give people %s — that is your front door, and it stays the same in "
+            "every session. This session sends as %s and drains its own queue; "
+            "replies to what you send here come back to %s."
+            % (account, agent_id, agent_id)
         )
     if KEYS_AVAILABLE:
         out["key_backend"] = keys.BACKEND
@@ -1332,29 +1696,41 @@ def do_whoami(_id, _args):
             {"pid": p, "agent_id": a} for p, a in sorted(peers.items())
         ]
     if account != agent_id and not out["is_primary"]:
-        out["note"] = (
-            "Another session holds the primary slot, so mail sent to %s is read "
-            "there, not here. This session reads %s." % (account, agent_id)
+        # Appended, not assigned: out["note"] is always already set here (this
+        # condition implies account != agent_id, which is note A's own guard), and
+        # dropping note A's "give people X" / "replies come back here" half would
+        # leave the non-primary case with only the primary-slot caveat.
+        out["note"] += (
+            " Another live session holds the primary slot, so front-door mail to "
+            "%s is drained there, not here; this session only drains %s."
+            % (account, agent_id)
         )
-    if source == "env" and info["agent_id"] != agent_id:
+    if source == "env" and info["shadowed"]:
         out["note"] = (
             "$AGENT_ID overrides the saved id %s; set_identity writes files but "
-            "cannot change this session's id until it is unset." % info["agent_id"]
+            "cannot change this session's id until it is unset." % info["shadowed"]
         )
-    elif info["source"] == "project" and info["shadowed"]:
-        out["note"] = (
-            "A project-scoped identity at %s overrides the global id %s, so this "
-            "directory is a different agent from other directories."
-            % (info["project_path"], info["shadowed"])
-        )
-    tool_result(_id, json.dumps(out))
+    return out
 
 
 def _identity_prompt(info, suggested, scope, drop_override):
-    """(prompt, schema) for the identity popup, shared by startup and set_identity."""
+    """(prompt, schema) for set_identity's confirmation popup.
+
+    (The startup popup that fires on a first run is a different function,
+    _session_prompt -- this one only ever runs from do_set_identity.)
+    """
     target_path = info["global_path"] if scope == "global" else info["project_path"]
 
     notes = ""
+    if not info["needs_setup"]:
+        # Only true of an actual RENAME -- a first run has no alias already
+        # claimed under any name, so the notice would be meaningless there.
+        notes += (
+            "\n\nRenaming changes the name new contacts see and the stem your "
+            "sessions are numbered from. It does NOT move the alias you already "
+            "claimed: the relay binds an alias to your KEY, first claim wins, so "
+            "people who already have your old name still reach you."
+        )
     if info["source"] == "env":
         notes += (
             "\n\nNOTE: $AGENT_ID=%s is set and takes precedence. Saving here updates "
@@ -1395,8 +1771,11 @@ def _identity_prompt(info, suggested, scope, drop_override):
             "Current:  %s   (%s)\n"
             "Proposed: %s\n\n"
             "%s\nSaved to: %s\n\n"
-            "This is the id other agents send to. After the change, messages addressed "
-            "to %s will NOT arrive — tell anyone who messages you about the new one.\n\n"
+            "This is the account address other agents send to directly. After the "
+            "change, mail addressed to the exact old address %s is delivered to "
+            "whichever session already answers to that address -- this one, if it "
+            "does; otherwise it sits in an orphaned queue that nothing drains "
+            "automatically until you go looking for it.\n\n"
             "Allowed: 2-64 chars of a-z, 0-9, dot, dash, underscore; start and end "
             "alphanumeric.%s\n\n"
             "Accept = save it.   Decline = keep %s."
@@ -1438,6 +1817,12 @@ def do_set_identity(_id, args):
     base = identity.find_directory()
     before = identity.describe(base)
     scope = "project" if (args.get("scope") or "").strip() == "project" else "global"
+    # Captured before any write: current_agent_id() falls back to
+    # identity.resolve_agent_id() whenever this session has not explicitly
+    # adopted an id of its own, so once the rename below lands that fallback
+    # would resolve to the NEW account address unless this session is pinned
+    # back onto whatever it already answered to.
+    session_before = current_agent_id()
 
     suggested = identity.normalize_agent_id(args.get("agent_id") or "") or ""
     if not suggested:
@@ -1510,17 +1895,79 @@ def do_set_identity(_id, args):
         tool_result(_id, "Could not write the identity file (%s)." % e, is_error=True)
         return
 
-    previous = current_agent_id()
-    env_pinned = bool(os.environ.get("AGENT_ID", "").strip())
-    if not env_pinned:
-        _adopt_session_id(canonical)
+    # This renames the ACCOUNT -- the stem session ids are derived from -- not this
+    # session's own address. Adopting `canonical` here (the old _adopt_session_id
+    # call) would move this session's queue onto the account address; if some
+    # OTHER live session holds the primary slot, both would then drain the same
+    # physical queue, which breaks the private-room guarantee inbox_addresses()
+    # relies on.
+    #
+    # Only for scope=="global": a project-scoped identity is a standalone
+    # address for one directory, same as set_agent_id's own project branch
+    # writes only the project file. account_name is the device-wide stem every
+    # OTHER directory's sessions derive their ids from -- a project rename
+    # must not touch it, or one directory's project-scoped choice silently
+    # renames every session on the machine.
+    #
+    # set_account_name() takes the identity lock that also guards
+    # session_counter, so the gate writes through it rather than touching the
+    # global record itself. Wrapped like set_agent_id() just above: `canonical`
+    # is already written to disk at this point, so an OSError here (a full
+    # disk, say) -- or a ValueError, independently reachable when `canonical`
+    # passes normalize_agent_id but its name portion fails the stricter
+    # normalize_name -- must not be allowed to propagate out of tools/call
+    # dispatch and take the whole gate down. Captured rather than handled
+    # inline: the re-pin below has to run regardless of whether this succeeds,
+    # so the error is reported AFTER it, not from inside this except block.
+    account_name_error = None
+    if scope == "global":
+        try:
+            identity.set_account_name(identity.agent_name(canonical))
+        except (ValueError, OSError) as e:
+            account_name_error = e
 
-    # Publish under the NEW address immediately. Waiting for the next check_inbox
-    # leaves a window where you have already told people your new name but nothing
-    # has claimed the alias for it, so sends to the bare name fail to resolve.
+    # Pin this session back onto its pre-rename address. This has to run on
+    # EVERY exit path past this point, success or failure above -- `canonical`
+    # is already on disk regardless of whether set_account_name just raised,
+    # and current_agent_id() falls through to identity.resolve_agent_id() for
+    # any session that never explicitly adopted an id of its own
+    # (SESSION_AGENT_ID is None, not declined). Returning early from the
+    # except block above, before this ran, was exactly that: it let such a
+    # session silently start answering as the NEW name on a rename that had
+    # only half-completed -- the bug this whole task exists to prevent,
+    # reappearing on the one path nothing was testing.
+    #
+    # env_pinned is handled by current_agent_id() itself (env always wins),
+    # and a declined session (session_before is None) must stay declined, not
+    # get opted back in as a side effect of an account rename.
+    if not os.environ.get("AGENT_ID", "").strip() and session_before is not None:
+        _adopt_session_id(session_before)
+
+    # Publish even if account_name failed above: account_agent_id() derives
+    # from resolve_agent_id()'s "agent_id" field, not from account_name, so
+    # the account's own front-door address is ALREADY fully `canonical` at
+    # this point regardless of that failure -- only the STEM used to number
+    # brand-new sessions is what stayed stale. Withholding the publish would
+    # leave the new address's alias unclaimed on the relay even though the
+    # account record already claims to be that address, which is worse than
+    # the numbering being stale: it makes the "new" address unreachable by
+    # name for anyone the user already told about it.
     _publish_identities()
 
-    msg = "User APPROVED. Agent ID is now %s (saved to %s, %s scope)." % (
+    if account_name_error is not None:
+        tool_result(
+            _id,
+            "Agent id saved as %s, but the account name could not be updated "
+            "(%s). This session is unaffected -- it still sends and receives "
+            "as %s. The account's address itself is already %s; only the stem "
+            "brand-new sessions number themselves from is still the old name, "
+            "so run set_identity again to retry that part."
+            % (canonical, account_name_error, current_agent_id(), canonical),
+            is_error=True,
+        )
+        return
+
+    msg = "User APPROVED. Account id is now %s (saved to %s, %s scope)." % (
         canonical,
         target_path,
         scope,
@@ -1532,18 +1979,14 @@ def do_set_identity(_id, args):
         )
     if canonical != chosen:
         msg += " Normalized from %r." % chosen
-    if env_pinned:
-        msg += (
-            "\n\nWARNING: $AGENT_ID=%s still takes precedence, so this session "
-            "continues to send and receive as %s. Unset AGENT_ID and restart for "
-            "%s to take effect." % (previous, previous, canonical)
-        )
-    else:
-        msg += (
-            "\nThis session now sends and receives as %s; messages to the previous id "
-            "(%s) will not arrive. Its WebSocket URL is %s."
-            % (canonical, previous, _ws_url(canonical))
-        )
+    msg += (
+        "\nThis renames the account new contacts see and the stem new sessions are "
+        "numbered from. This session itself keeps sending and receiving as %s -- "
+        "it does not adopt %s. It also does NOT move the alias you already "
+        "claimed: the relay binds an alias to your key, first claim wins, so "
+        "people who already have your old name still reach you."
+        % (current_agent_id(), canonical)
+    )
     tool_result(_id, msg)
 
 
@@ -1611,22 +2054,30 @@ TOOLS = [
     {
         "name": "whoami",
         "description": "Return this session's antrozous identity and the exact WebSocket URL to "
-        "monitor for inbound-message doorbells, as {agent_id, relay_url, ws_url}. "
-        "Call this BEFORE arming a Monitor so the ws URL matches this gate's "
-        "identity and relay.",
+        "monitor for inbound-message doorbells, as {agent_id, share_this, "
+        "sends_from, relay_url, ws_url}. share_this is the stable account address "
+        "to hand out; sends_from is the address this session's own messages "
+        "actually carry, which can differ from it. Call this BEFORE arming a "
+        "Monitor so the ws URL matches this gate's identity and relay.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "set_identity",
-        "description": "Propose a new antrozous agent id for this user. The USER "
+        "description": "Propose a new antrozous ACCOUNT name for this user -- the stem "
+        "every session id is derived from, and the name new contacts see. The USER "
         "confirms (or edits) it in an approval popup shown out-of-band; the rename "
         "only happens if they accept, so treat your 'agent_id' argument as a "
         "suggestion, not a decision. Omit it to let the popup propose a default. "
-        "Once accepted it is saved to .antrozous/identity.json and takes effect "
-        "immediately, with no restart. Call when the user asks to rename their agent, "
-        "set/change their agent id, or pick a friendlier handle than the generated "
-        "one. This changes which inbox the session receives on — messages sent to the "
-        "old id will not arrive.",
+        "Once accepted it is saved to ~/.antrozous/identity.json -- or to the "
+        "directory's own .antrozous/identity.json when scope is 'project' -- and "
+        "takes effect immediately, with no restart. Call when the user asks to "
+        "rename their agent "
+        "or account, set/change their agent id, or pick a friendlier handle than the "
+        "generated one. This renames the account, not this session — THIS session "
+        "keeps sending and receiving on its own address either way. It also does not "
+        "move the alias already claimed under the old name: the relay binds an alias "
+        "to a key, first claim wins, so people who already have the old name still "
+        "reach you.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1661,6 +2112,8 @@ def main():
             break
         method, _id = msg.get("method"), msg.get("id")
         if _handle_startup_reply(msg):
+            continue
+        if _handle_migration_reply(msg):
             continue
         if method is None:
             # A response, not a request: never answer it with an error.
@@ -1721,5 +2174,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        # Stale entries are also pruned by live_sessions(), so a hard kill is safe.
+        # Nothing here is ever deleted -- session records persist so a resumed
+        # session finds its own address. A hard kill (no finally block runs) is
+        # still safe: live_sessions() treats a dead pid as not-live regardless
+        # of whether unregister_session() ran to clear it.
         identity.unregister_session()

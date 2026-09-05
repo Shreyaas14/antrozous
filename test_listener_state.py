@@ -7,6 +7,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
+import bootstrap_identity
+import identity
 import listener_state
 
 SCRIPT = os.path.join(
@@ -481,6 +483,199 @@ class HookResumeTests(ListenerStateTest):
         self.assertIn("systemMessage", payload)
         # Unreadable now falls back to the default, which is on.
         self.assertIn("ON BY DEFAULT", self.context_of(payload))
+
+
+class HookAnnouncementTests(ListenerStateTest):
+    def run_hook(self, **env):
+        base = dict(
+            os.environ,
+            ANTROZOUS_HOME=self.home,
+            USER="testuser",
+            ANTROZOUS_AUTO_LISTEN="1",
+        )
+        base.update(env)
+        result = subprocess.run(
+            [sys.executable, HOOK],
+            capture_output=True,
+            text=True,
+            env=base,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_resumed_session_is_announced_with_its_full_id(self):
+        os.makedirs(os.path.join(self.home, "sessions"), exist_ok=True)
+        path = os.path.join(self.home, "sessions", "sess-a.json")
+        with open(path, "w") as f:
+            json.dump({"agent_id": "anish-bot-3.e5ox72jb", "pid": None}, f)
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-a")
+        self.assertIn("anish-bot-3.e5ox72jb", payload["systemMessage"])
+
+    def test_unknown_session_does_not_invent_an_ordinal(self):
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertNotIn("-1.", payload["systemMessage"])
+
+    def context_of(self, payload):
+        return (payload.get("hookSpecificOutput") or {}).get("additionalContext", "")
+
+    def _named_account(self):
+        identity_json = os.path.join(self.home, "identity.json")
+        with open(identity_json, "w") as f:
+            json.dump(
+                {
+                    "agent_id": "anish-bot.e5ox72jb",
+                    "account_name": "anish-bot",
+                    "fingerprint": "e5ox72jb",
+                    "confirmed": True,
+                },
+                f,
+            )
+
+    def test_a_later_run_does_not_announce_a_popup(self):
+        """Task 4 deleted the per-session popup. The hook must stop promising it."""
+        self._named_account()
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertNotIn("prompt will appear", payload["systemMessage"])
+
+    def test_a_first_run_still_announces_the_popup(self):
+        payload = self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertIn("prompt will appear", payload["systemMessage"])
+
+    def test_a_later_runs_model_directive_does_not_promise_a_popup(self):
+        """The half that was missed. Branching only the human-visible
+        systemMessage left the MODEL's additionalContext still saying the id "is
+        being chosen by a popup the gate raises at startup" and listing "says no
+        prompt appeared" as a reason to call set_identity -- which from session two
+        onward is the normal state, so the directive actively invited a spurious
+        set_identity call. A wrong instruction here produces wrong agent
+        behaviour, not just a confused reader."""
+        self._named_account()
+        context = self.context_of(
+            self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        )
+        self.assertNotIn("popup the gate raises", context)
+        self.assertNotIn("says no prompt appeared", context)
+        self.assertIn("NO naming popup appears", context)
+        self.assertIn("anish-bot.e5ox72jb", context)
+
+    def test_a_later_runs_model_directive_still_forbids_a_reflex_set_identity(self):
+        """Dropping the popup claim must not drop the instruction it carried."""
+        self._named_account()
+        context = self.context_of(
+            self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        )
+        self.assertIn("Do NOT call", context)
+        self.assertIn("set_identity", context)
+        self.assertIn("whoami", context)
+
+    def test_a_first_runs_model_directive_still_announces_the_popup(self):
+        """The other branch has to keep saying what is true of a FIRST run."""
+        context = self.context_of(
+            self.run_hook(AGENT_ID="", CLAUDE_CODE_SESSION_ID="sess-new")
+        )
+        self.assertIn("popup the gate raises", context)
+
+
+class SessionLineDirectTests(ListenerStateTest):
+    """session_line() called directly, bypassing the hook's own __main__.
+
+    identity.describe() -- pre-existing, unmodified, and unguarded -- reads both
+    the project and global identity files unconditionally as the very first
+    statement of the hook's __main__. Any corruption severe enough to make
+    account_agent_id() raise ALSO makes describe() raise, before session_line() is
+    ever reached.
+
+    This docstring used to add that the same scenario run through the real hook
+    subprocess "still exits 1 with a traceback out of identity.describe()". A later
+    commit added the top-level try/except around the hook's __main__ (see
+    HookTopLevelGuardTests) and that stopped being true two commits after it was
+    written -- verified: the scenario below, run through the hook subprocess, exits
+    0 and emits FALLBACK_ANNOUNCEMENT. The subprocess is therefore covered
+    elsewhere; what is isolated and proven HERE is session_line()'s own contract:
+    called directly, it must not raise even when the account_agent_id() call it
+    makes internally does.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if os.geteuid() == 0:
+            self.skipTest("running as root defeats permission-based tests")
+
+    def test_survives_an_unreadable_project_identity_file(self):
+        os.makedirs(os.path.join(self.home, "sessions"), exist_ok=True)
+        with open(os.path.join(self.home, "sessions", "sess-a.json"), "w") as f:
+            json.dump({"agent_id": "anish-bot-3.e5ox72jb", "pid": None}, f)
+        with open(os.path.join(self.home, "identity.json"), "w") as f:
+            json.dump({"account_name": "anish-bot"}, f)
+
+        project_dir = os.path.join(self._tmp.name, "project")
+        os.makedirs(os.path.join(project_dir, ".antrozous"))
+        project_identity = os.path.join(project_dir, ".antrozous", "identity.json")
+        with open(project_identity, "w") as f:
+            json.dump({"not_agent_id": "irrelevant"}, f)
+        os.chmod(project_identity, 0o000)
+        self.addCleanup(os.chmod, project_identity, 0o600)
+
+        saved = {
+            k: os.environ.get(k)
+            for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR", "AGENT_ID")
+        }
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(restore)
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-a"
+        os.environ["CLAUDE_PROJECT_DIR"] = project_dir
+        os.environ.pop("AGENT_ID", None)
+
+        try:
+            line = bootstrap_identity.session_line()  # must not raise
+        except Exception as e:
+            self.fail("session_line() raised %r instead of degrading" % (e,))
+        self.assertIsInstance(line, str)
+
+
+class HookTopLevelGuardTests(ListenerStateTest):
+    """A corrupt or unreadable identity file must not crash SessionStart itself.
+
+    identity.describe() is unguarded and is the first statement of __main__, so
+    any identity-file corruption/permission failure currently propagates all the
+    way out of the process. A crashed SessionStart hook stops the session from
+    starting, so __main__ needs its own top-level guard independent of anything
+    describe() itself does or does not catch.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if os.geteuid() == 0:
+            self.skipTest("running as root defeats permission-based tests")
+
+    def test_unreadable_global_identity_does_not_crash_the_hook(self):
+        identity_json = os.path.join(self.home, "identity.json")
+        with open(identity_json, "w") as f:
+            json.dump({"agent_id": "anish-bot.e5ox72jb", "confirmed": True}, f)
+        os.chmod(identity_json, 0o000)
+        self.addCleanup(os.chmod, identity_json, 0o600)
+
+        result = subprocess.run(
+            [sys.executable, HOOK],
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ, ANTROZOUS_HOME=self.home, USER="testuser", AGENT_ID=""
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("systemMessage", payload)
+        self.assertIn("could not read", payload["systemMessage"].lower())
+        # The fallback must not pretend things are fine.
+        self.assertNotIn("ready", payload["systemMessage"].lower())
 
 
 if __name__ == "__main__":

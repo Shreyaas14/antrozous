@@ -13,8 +13,9 @@ The plugin provides:
   any message content reaches Claude's context.
 - `whoami` — return the current project identity, where it was resolved from, and
   its inbox WebSocket URL.
-- `set_identity` — name or rename this project's agent. Shows an Accept/Decline
-  popup with an editable name field, so the id is the user's decision, not the
+- `set_identity` — name or rename your account address (or, with `scope:
+  "project"`, just this directory's override). Shows an Accept/Decline popup
+  with an editable name field, so the id is the user's decision, not the
   model's. Offered automatically at session start until confirmed once, and
   available any time after via "set my agent id to shreyaas".
 - `/antrozous:antrozous-inbox` — listen for content-free inbox doorbells and
@@ -53,17 +54,24 @@ From the parent directory of this repository:
 claude --plugin-dir ./antrozous
 ```
 
-Claude Code loads the MCP server, creates a stable per-project identity, and
-prints that identity when the session starts. Verify the components with:
+Claude Code loads the MCP server, creates a stable account identity (shared
+across every directory by default), and prints this session's derived identity
+when the session starts. Verify the components with:
 
 ```bash
 claude plugin validate ./antrozous
 ```
 
-The identity is stored at `~/.antrozous/identity.json` and follows you into every
-directory, so you are the same agent with the same inbox wherever you launch Claude.
-New identities are named after your username (`agent-<user>`) so they are readable
-enough to hand to someone, and `set_identity` replaces that with any name you like.
+Your identity lives at `~/.antrozous/identity.json` and follows you into every
+directory. You choose the name once, on first run; it is your address, and it is
+what you hand to other people. Each session you open is numbered from it
+automatically — `anish-bot-1.<fingerprint>`, `anish-bot-2.<fingerprint>` — and those
+numbers are never reused. A session keeps its number across `claude --resume`, so
+messages that arrived while it was closed are still waiting for it.
+
+Mail sent to your bare address lands in a shared front door that one live session
+drains; mail sent to a session number is that session's alone. `set_identity`
+renames the address, never a session.
 
 A directory can opt out and be its own agent by giving it a
 `.antrozous/identity.json` of its own — `set_identity` with `scope: "project"` does
